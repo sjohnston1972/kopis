@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+
+<html class="light" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Device Inventory | Network Twin</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            colors: {
+              "secondary": "#006c4f",
+              "outline": "#717786",
+              "on-primary-container": "#fefcff",
+              "on-tertiary-container": "#fcfcff",
+              "surface-container-high": "#e7e8e9",
+              "on-secondary": "#ffffff",
+              "surface-tint": "#005bc0",
+              "primary-fixed": "#d8e2ff",
+              "inverse-on-surface": "#f0f1f2",
+              "primary": "#0059bb",
+              "on-secondary-fixed-variant": "#00513a",
+              "tertiary-container": "#71757a",
+              "surface-bright": "#f8f9fa",
+              "surface-dim": "#d9dadb",
+              "on-surface": "#191c1d",
+              "tertiary": "#585c61",
+              "secondary-fixed-dim": "#44dfab",
+              "on-error-container": "#93000a",
+              "outline-variant": "#c1c6d7",
+              "primary-container": "#0070ea",
+              "on-tertiary-fixed-variant": "#43474c",
+              "primary-fixed-dim": "#adc7ff",
+              "error": "#ba1a1a",
+              "inverse-primary": "#adc7ff",
+              "background": "#f8f9fa",
+              "inverse-surface": "#2e3132",
+              "surface-container-highest": "#e1e3e4",
+              "error-container": "#ffdad6",
+              "on-primary-fixed": "#001a41",
+              "surface-variant": "#e1e3e4",
+              "surface-container-lowest": "#ffffff",
+              "on-background": "#191c1d",
+              "on-secondary-container": "#007354",
+              "surface-container-low": "#f3f4f5",
+              "on-tertiary": "#ffffff",
+              "on-primary-fixed-variant": "#004493",
+              "on-primary": "#ffffff",
+              "on-surface-variant": "#414754",
+              "on-tertiary-fixed": "#181c20",
+              "surface": "#f8f9fa",
+              "on-error": "#ffffff",
+              "secondary-fixed": "#67fcc6",
+              "tertiary-fixed": "#e0e3e8",
+              "tertiary-fixed-dim": "#c3c7cc",
+              "secondary-container": "#67fcc6",
+              "surface-container": "#edeeef",
+              "on-secondary-fixed": "#002116"
+            },
+            fontFamily: {
+              "headline": ["Inter"],
+              "body": ["Inter"],
+              "label": ["Inter"]
+            },
+            borderRadius: {"DEFAULT": "0.25rem", "lg": "0.5rem", "xl": "0.75rem", "full": "9999px"},
+          },
+        },
+      }
+    </script>
+<style>
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+            vertical-align: middle;
+        }
+        body { font-family: 'Inter', sans-serif; }
+        .glass-panel {
+            background: rgba(255, 255, 255, 0.7);
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
+        }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #e1e3e4; border-radius: 10px; }
+    </style>
+</head>
+<body class="bg-background text-on-surface flex min-h-screen overflow-hidden">
+<!-- SideNavBar (Shared Component) -->
+<aside class="fixed left-0 top-0 h-full flex flex-col pt-20 pb-6 px-4 h-screen w-64 border-r border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 z-30">
+<div class="mb-8 px-4">
+<div class="flex items-center gap-3">
+<div class="w-10 h-10 rounded-lg bg-primary flex items-center justify-center text-white shadow-lg shadow-primary/20">
+<span class="material-symbols-outlined">hub</span>
+</div>
+<div>
+<h2 class="text-sm font-bold tracking-tight text-slate-900 dark:text-white">Global Network</h2>
+<p class="text-[10px] uppercase tracking-widest text-secondary font-bold">Operational</p>
+</div>
+</div>
+</div>
+<nav class="flex-1 space-y-1">
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-lg transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined">dashboard</span>
+<span class="font-['Inter'] text-sm font-semibold">Overview</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-lg transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined">hub</span>
+<span class="font-['Inter'] text-sm font-semibold">Topology</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-blue-700 dark:text-blue-300 bg-blue-50/50 dark:bg-blue-900/20 rounded-lg transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined">router</span>
+<span class="font-['Inter'] text-sm font-semibold">Devices</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-lg transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined">monitor_heart</span>
+<span class="font-['Inter'] text-sm font-semibold">Health</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-lg transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined">psychology</span>
+<span class="font-['Inter'] text-sm font-semibold">AI Insights</span>
+</a>
+</nav>
+<div class="mt-auto pt-6 border-t border-slate-200 dark:border-slate-800 space-y-1">
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-lg transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined">help</span>
+<span class="font-['Inter'] text-sm font-semibold">Support</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-lg transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined">description</span>
+<span class="font-['Inter'] text-sm font-semibold">Documentation</span>
+</a>
+</div>
+</aside>
+<!-- Main Content Area -->
+<div class="flex-1 flex flex-col min-w-0 ml-64">
+<!-- TopNavBar (Shared Component) -->
+<header class="flex items-center justify-between px-6 w-full sticky top-0 z-40 bg-white dark:bg-slate-900 w-full h-16 border-b border-slate-100 dark:border-slate-800 shadow-sm dark:shadow-none">
+<div class="flex items-center gap-8">
+<h1 class="text-xl font-bold tracking-tighter text-slate-900 dark:text-white">Network Twin</h1>
+<div class="hidden md:flex items-center gap-2 bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-lg w-96 group">
+<span class="material-symbols-outlined text-slate-400 group-focus-within:text-primary">search</span>
+<input class="bg-transparent border-none focus:ring-0 text-sm w-full placeholder:text-slate-400" placeholder="Search devices, IPs, or sites..." type="text"/>
+</div>
+</div>
+<div class="flex items-center gap-4">
+<button class="p-2 text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors rounded-full relative">
+<span class="material-symbols-outlined">notifications</span>
+<span class="absolute top-2 right-2 w-2 h-2 bg-error rounded-full border-2 border-white"></span>
+</button>
+<button class="p-2 text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors rounded-full">
+<span class="material-symbols-outlined">settings</span>
+</button>
+<div class="h-8 w-8 rounded-full overflow-hidden border border-slate-200">
+<img alt="User profile avatar" class="w-full h-full object-cover" data-alt="Professional user profile portrait with a neutral background and clean lighting" src="https://lh3.googleusercontent.com/aida-public/AB6AXuCdnLHdkp5sr6eBuYvAfVA0TRWqQOC4H0ZKrBjR2-kt1qa25qfkVLzAVSBjXn2PERMjvEuOYMSR50CQ_Ea9Z8rqIt-6vAPQbfLE7SkmyB7gWC6Zpq9OFFNy9y1Ea6LuhIpCYBTjMS5JfwK1NehbII37yVOCda9DAPYxyjZUO2ebl4ZFuMwJuoCoFeFWasHczXSNLeZViugDmzuVj_4evMpmvPxM5jvc_lIeWd6vsTaTA-LF9wkJ2GoJ62LJav6Jq5aAmOle15OXsxw"/>
+</div>
+</div>
+</header>
+<!-- Page Canvas -->
+<main class="flex-1 flex overflow-hidden">
+<!-- Left Side: Table View -->
+<div class="flex-1 flex flex-col bg-surface overflow-hidden">
+<!-- Filters Bar -->
+<div class="px-8 py-6 flex items-center justify-between gap-4">
+<div class="flex items-center gap-3">
+<h2 class="text-2xl font-extrabold tracking-tight text-on-surface">Inventory</h2>
+<span class="px-2 py-0.5 bg-surface-container-high rounded-full text-xs font-bold text-on-surface-variant">248 TOTAL</span>
+</div>
+<div class="flex items-center gap-2">
+<div class="flex bg-surface-container-low rounded-lg p-1">
+<button class="px-3 py-1 text-xs font-bold bg-white shadow-sm rounded-md text-primary">ALL</button>
+<button class="px-3 py-1 text-xs font-bold text-on-surface-variant hover:text-on-surface">ACTIVE</button>
+<button class="px-3 py-1 text-xs font-bold text-on-surface-variant hover:text-on-surface">ISSUES</button>
+</div>
+<button class="flex items-center gap-2 px-4 py-2 bg-surface-container-highest rounded-lg text-sm font-medium hover:bg-surface-container-high transition-colors">
+<span class="material-symbols-outlined text-sm">filter_list</span>
+                            Filter
+                        </button>
+<button class="flex items-center gap-2 px-4 py-2 bg-primary text-white rounded-lg text-sm font-medium shadow-lg shadow-primary/10 hover:opacity-90 transition-all">
+<span class="material-symbols-outlined text-sm">add</span>
+                            Add Device
+                        </button>
+</div>
+</div>
+<!-- Main Table -->
+<div class="flex-1 overflow-y-auto px-8 pb-8">
+<div class="bg-surface-container-lowest rounded-xl overflow-hidden">
+<table class="w-full text-left border-collapse">
+<thead>
+<tr class="bg-surface-container-low border-none">
+<th class="px-6 py-4 text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">Hostname</th>
+<th class="px-6 py-4 text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">Status</th>
+<th class="px-6 py-4 text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">Role</th>
+<th class="px-6 py-4 text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">IP Address</th>
+<th class="px-6 py-4 text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">Software</th>
+<th class="px-6 py-4 text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">Compliance</th>
+<th class="px-6 py-4 w-10"></th>
+</tr>
+</thead>
+<tbody class="divide-y divide-surface-container-low">
+<!-- Row 1 -->
+<tr class="hover:bg-blue-50/30 transition-colors cursor-pointer group bg-blue-50/10">
+<td class="px-6 py-5">
+<div class="flex flex-col">
+<span class="font-bold text-primary group-hover:underline">CR-01-AMSTERDAM</span>
+<span class="text-[11px] text-on-surface-variant font-medium">Cisco ASR-9001</span>
+</div>
+</td>
+<td class="px-6 py-5">
+<div class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-secondary/10 text-secondary text-[11px] font-bold">
+<span class="w-1.5 h-1.5 rounded-full bg-secondary animate-pulse"></span>
+                                            ONLINE
+                                        </div>
+</td>
+<td class="px-6 py-5">
+<span class="text-sm font-semibold text-on-surface">Core</span>
+</td>
+<td class="px-6 py-5">
+<span class="text-sm font-mono text-on-surface-variant">10.255.0.1</span>
+</td>
+<td class="px-6 py-5">
+<span class="text-sm font-medium text-on-surface">IOS-XR 7.3.2</span>
+</td>
+<td class="px-6 py-5">
+<div class="flex items-center gap-2">
+<div class="flex-1 h-1.5 bg-surface-container-high rounded-full overflow-hidden max-w-[60px]">
+<div class="h-full bg-secondary w-full"></div>
+</div>
+<span class="text-[11px] font-bold text-secondary">Compliant</span>
+</div>
+</td>
+<td class="px-6 py-5 text-right">
+<span class="material-symbols-outlined text-slate-400 group-hover:text-primary">chevron_right</span>
+</td>
+</tr>
+<!-- Row 2 -->
+<tr class="hover:bg-slate-50 transition-colors cursor-pointer group">
+<td class="px-6 py-5">
+<div class="flex flex-col">
+<span class="font-bold text-on-surface">AS-22-BERLIN</span>
+<span class="text-[11px] text-on-surface-variant font-medium">Juniper EX4300</span>
+</div>
+</td>
+<td class="px-6 py-5">
+<div class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-secondary/10 text-secondary text-[11px] font-bold">
+<span class="w-1.5 h-1.5 rounded-full bg-secondary"></span>
+                                            ONLINE
+                                        </div>
+</td>
+<td class="px-6 py-5">
+<span class="text-sm font-semibold text-on-surface">Access</span>
+</td>
+<td class="px-6 py-5">
+<span class="text-sm font-mono text-on-surface-variant">172.16.22.4</span>
+</td>
+<td class="px-6 py-5">
+<span class="text-sm font-medium text-on-surface">Junos 21.4R1</span>
+</td>
+<td class="px-6 py-5">
+<div class="flex items-center gap-2">
+<div class="flex-1 h-1.5 bg-surface-container-high rounded-full overflow-hidden max-w-[60px]">
+<div class="h-full bg-tertiary-container w-4/5"></div>
+</div>
+<span class="text-[11px] font-bold text-tertiary-container">Vulnerable</span>
+</div>
+</td>
+<td class="px-6 py-5 text-right">
+<span class="material-symbols-outlined text-slate-400">chevron_right</span>
+</td>
+</tr>
+<!-- Row 3 -->
+<tr class="hover:bg-slate-50 transition-colors cursor-pointer group">
+<td class="px-6 py-5">
+<div class="flex flex-col">
+<span class="font-bold text-on-surface">GW-04-LONDON</span>
+<span class="text-[11px] text-on-surface-variant font-medium">Arista DCS-7280</span>
+</div>
+</td>
+<td class="px-6 py-5">
+<div class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-error/10 text-error text-[11px] font-bold">
+<span class="w-1.5 h-1.5 rounded-full bg-error"></span>
+                                            OFFLINE
+                                        </div>
+</td>
+<td class="px-6 py-5">
+<span class="text-sm font-semibold text-on-surface">Edge</span>
+</td>
+<td class="px-6 py-5">
+<span class="text-sm font-mono text-on-surface-variant">192.168.4.1</span>
+</td>
+<td class="px-6 py-5">
+<span class="text-sm font-medium text-on-surface">EOS 4.25.1F</span>
+</td>
+<td class="px-6 py-5">
+<div class="flex items-center gap-2">
+<div class="flex-1 h-1.5 bg-surface-container-high rounded-full overflow-hidden max-w-[60px]">
+<div class="h-full bg-error w-1/3"></div>
+</div>
+<span class="text-[11px] font-bold text-error">Critical</span>
+</div>
+</td>
+<td class="px-6 py-5 text-right">
+<span class="material-symbols-outlined text-slate-400">chevron_right</span>
+</td>
+</tr>
+<!-- Row 4 -->
+<tr class="hover:bg-slate-50 transition-colors cursor-pointer group">
+<td class="px-6 py-5">
+<div class="flex flex-col">
+<span class="font-bold text-on-surface">AS-09-PARIS</span>
+<span class="text-[11px] text-on-surface-variant font-medium">Cisco Catalyst 9300</span>
+</div>
+</td>
+<td class="px-6 py-5">
+<div class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-secondary/10 text-secondary text-[11px] font-bold">
+<span class="w-1.5 h-1.5 rounded-full bg-secondary"></span>
+                                            ONLINE
+                                        </div>
+</td>
+<td class="px-6 py-5">
+<span class="text-sm font-semibold text-on-surface">Access</span>
+</td>
+<td class="px-6 py-5">
+<span class="text-sm font-mono text-on-surface-variant">172.16.9.12</span>
+</td>
+<td class="px-6 py-5">
+<span class="text-sm font-medium text-on-surface">IOS-XE 17.6.1</span>
+</td>
+<td class="px-6 py-5">
+<div class="flex items-center gap-2">
+<div class="flex-1 h-1.5 bg-surface-container-high rounded-full overflow-hidden max-w-[60px]">
+<div class="h-full bg-secondary w-full"></div>
+</div>
+<span class="text-[11px] font-bold text-secondary">Compliant</span>
+</div>
+</td>
+<td class="px-6 py-5 text-right">
+<span class="material-symbols-outlined text-slate-400">chevron_right</span>
+</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</div>
+<!-- Right Side: Detail Panel -->
+<aside class="w-96 border-l border-slate-200 bg-surface-container-low flex flex-col z-10 shadow-[-12px_0_24px_-12px_rgba(0,0,0,0.05)]">
+<!-- Panel Header -->
+<div class="p-6 bg-surface-container-lowest border-b border-surface-container-low">
+<div class="flex items-center justify-between mb-4">
+<span class="text-[10px] font-extrabold uppercase tracking-widest text-primary">Core Node</span>
+<button class="p-1 hover:bg-surface-container-low rounded-full">
+<span class="material-symbols-outlined text-lg">close</span>
+</button>
+</div>
+<h3 class="text-xl font-extrabold text-on-surface mb-1">CR-01-AMSTERDAM</h3>
+<div class="flex items-center gap-2">
+<span class="w-2 h-2 rounded-full bg-secondary"></span>
+<p class="text-xs font-semibold text-on-surface-variant">ASR-9001 • Amsterdam DC-01</p>
+</div>
+</div>
+<!-- Detail Tabs -->
+<div class="flex border-b border-surface-container-high bg-surface-container-lowest px-4">
+<button class="flex-1 py-3 text-xs font-bold text-primary border-b-2 border-primary">CONFIG</button>
+<button class="flex-1 py-3 text-xs font-bold text-on-surface-variant hover:text-on-surface transition-colors">INTERFACES</button>
+<button class="flex-1 py-3 text-xs font-bold text-on-surface-variant hover:text-on-surface transition-colors">HEALTH</button>
+</div>
+<!-- Tab Content: Config -->
+<div class="flex-1 overflow-y-auto p-6 space-y-6">
+<!-- Config Snippet -->
+<div class="space-y-3">
+<div class="flex items-center justify-between">
+<h4 class="text-xs font-extrabold uppercase tracking-widest text-on-surface-variant">Running Config</h4>
+<button class="text-xs font-bold text-primary flex items-center gap-1">
+<span class="material-symbols-outlined text-sm">content_copy</span>
+                                Copy
+                            </button>
+</div>
+<div class="bg-slate-900 rounded-lg p-4 font-mono text-[11px] leading-relaxed text-slate-300">
+<p><span class="text-teal-400">hostname</span> CR-01-AMSTERDAM</p>
+<p><span class="text-teal-400">!</span></p>
+<p><span class="text-teal-400">interface</span> Loopback0</p>
+<p>  ipv4 address 10.255.0.1 255.255.255.255</p>
+<p><span class="text-teal-400">!</span></p>
+<p><span class="text-teal-400">router</span> isis CORE</p>
+<p>  net 49.0001.0102.0102.0001.00</p>
+<p>  address-family ipv4 unicast</p>
+<p>    metric-style wide</p>
+</div>
+</div>
+<!-- Health Metrics Bento -->
+<div class="space-y-3">
+<h4 class="text-xs font-extrabold uppercase tracking-widest text-on-surface-variant">Quick Metrics</h4>
+<div class="grid grid-cols-2 gap-3">
+<div class="bg-surface-container-lowest p-4 rounded-xl shadow-sm border border-white">
+<span class="text-[10px] font-bold text-on-surface-variant block mb-1">CPU LOAD</span>
+<div class="flex items-end gap-1">
+<span class="text-2xl font-extrabold text-on-surface">14%</span>
+<span class="material-symbols-outlined text-secondary text-sm mb-1">trending_down</span>
+</div>
+</div>
+<div class="bg-surface-container-lowest p-4 rounded-xl shadow-sm border border-white">
+<span class="text-[10px] font-bold text-on-surface-variant block mb-1">UPTIME</span>
+<div class="flex items-end gap-1">
+<span class="text-2xl font-extrabold text-on-surface">184d</span>
+</div>
+</div>
+<div class="bg-surface-container-lowest p-4 rounded-xl shadow-sm border border-white">
+<span class="text-[10px] font-bold text-on-surface-variant block mb-1">TEMP</span>
+<div class="flex items-end gap-1">
+<span class="text-2xl font-extrabold text-on-surface">42°C</span>
+<span class="text-[10px] text-secondary font-bold mb-1">Optimal</span>
+</div>
+</div>
+<div class="bg-surface-container-lowest p-4 rounded-xl shadow-sm border border-white">
+<span class="text-[10px] font-bold text-on-surface-variant block mb-1">ERRORS</span>
+<div class="flex items-end gap-1">
+<span class="text-2xl font-extrabold text-on-surface">0</span>
+<span class="text-[10px] text-secondary font-bold mb-1">Clear</span>
+</div>
+</div>
+</div>
+</div>
+<!-- Compliance State -->
+<div class="bg-secondary/5 rounded-xl p-4 border border-secondary/10">
+<div class="flex items-center gap-3 mb-2">
+<span class="material-symbols-outlined text-secondary">verified_user</span>
+<h4 class="text-sm font-bold text-secondary">Compliance Verified</h4>
+</div>
+<p class="text-[11px] leading-relaxed text-on-secondary-container opacity-80">
+                            This device matches the gold-standard configuration template for Core-Nodes-v2. Last audited 4 hours ago.
+                        </p>
+</div>
+</div>
+<!-- Panel Footer -->
+<div class="p-6 bg-surface-container-lowest border-t border-surface-container-low grid grid-cols-2 gap-3">
+<button class="px-4 py-2.5 bg-surface-container-highest text-on-surface rounded-lg text-xs font-bold hover:bg-surface-container-high transition-colors">REBOOT</button>
+<button class="px-4 py-2.5 bg-primary text-white rounded-lg text-xs font-bold hover:opacity-90 shadow-md shadow-primary/10 transition-all">EDIT CONFIG</button>
+</div>
+</aside>
+</main>
+</div>
+</body></html>

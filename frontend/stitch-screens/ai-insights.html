@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+
+<html class="light" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Network Twin - AI Insights</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            colors: {
+              "secondary": "#006c4f",
+              "outline": "#717786",
+              "on-primary-container": "#fefcff",
+              "on-tertiary-container": "#fcfcff",
+              "surface-container-high": "#e7e8e9",
+              "on-secondary": "#ffffff",
+              "surface-tint": "#005bc0",
+              "primary-fixed": "#d8e2ff",
+              "inverse-on-surface": "#f0f1f2",
+              "primary": "#0059bb",
+              "on-secondary-fixed-variant": "#00513a",
+              "tertiary-container": "#71757a",
+              "surface-bright": "#f8f9fa",
+              "surface-dim": "#d9dadb",
+              "on-surface": "#191c1d",
+              "tertiary": "#585c61",
+              "secondary-fixed-dim": "#44dfab",
+              "on-error-container": "#93000a",
+              "outline-variant": "#c1c6d7",
+              "primary-container": "#0070ea",
+              "on-tertiary-fixed-variant": "#43474c",
+              "primary-fixed-dim": "#adc7ff",
+              "error": "#ba1a1a",
+              "inverse-primary": "#adc7ff",
+              "background": "#f8f9fa",
+              "inverse-surface": "#2e3132",
+              "surface-container-highest": "#e1e3e4",
+              "error-container": "#ffdad6",
+              "on-primary-fixed": "#001a41",
+              "surface-variant": "#e1e3e4",
+              "surface-container-lowest": "#ffffff",
+              "on-background": "#191c1d",
+              "on-secondary-container": "#007354",
+              "surface-container-low": "#f3f4f5",
+              "on-tertiary": "#ffffff",
+              "on-primary-fixed-variant": "#004493",
+              "on-primary": "#ffffff",
+              "on-surface-variant": "#414754",
+              "on-tertiary-fixed": "#181c20",
+              "surface": "#f8f9fa",
+              "on-error": "#ffffff",
+              "secondary-fixed": "#67fcc6",
+              "tertiary-fixed": "#e0e3e8",
+              "tertiary-fixed-dim": "#c3c7cc",
+              "secondary-container": "#67fcc6",
+              "surface-container": "#edeeef",
+              "on-secondary-fixed": "#002116"
+            },
+            fontFamily: {
+              "headline": ["Inter"],
+              "body": ["Inter"],
+              "label": ["Inter"]
+            },
+            borderRadius: {"DEFAULT": "0.25rem", "lg": "0.5rem", "xl": "0.75rem", "full": "9999px"},
+          },
+        },
+      }
+    </script>
+<style>
+      .material-symbols-outlined {
+        font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+      }
+      .glass-card {
+        background: rgba(255, 255, 255, 0.7);
+        backdrop-filter: blur(24px);
+      }
+    </style>
+</head>
+<body class="bg-background font-body text-on-surface">
+<!-- TopNavBar -->
+<header class="flex items-center justify-between px-6 w-full sticky top-0 z-40 bg-white dark:bg-slate-900 h-16 shadow-sm dark:shadow-none font-['Inter'] text-sm font-medium tracking-tight">
+<div class="flex items-center gap-8">
+<span class="text-xl font-bold tracking-tighter text-slate-900 dark:text-white">Network Twin</span>
+<div class="hidden md:flex gap-6">
+<a class="text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors px-3 py-2 rounded-lg" href="#">Overview</a>
+<a class="text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors px-3 py-2 rounded-lg" href="#">Topology</a>
+<a class="text-blue-600 dark:text-blue-400 border-b-2 border-blue-600 px-3 py-2" href="#">AI Insights</a>
+</div>
+</div>
+<div class="flex items-center gap-4">
+<div class="bg-surface-container-low px-3 py-1.5 rounded-full flex items-center gap-2">
+<span class="material-symbols-outlined text-outline text-lg" data-icon="search">search</span>
+<input class="bg-transparent border-none focus:ring-0 text-xs w-48" placeholder="Search network..." type="text"/>
+</div>
+<span class="material-symbols-outlined text-on-surface-variant cursor-pointer" data-icon="notifications">notifications</span>
+<span class="material-symbols-outlined text-on-surface-variant cursor-pointer" data-icon="settings">settings</span>
+<div class="w-8 h-8 rounded-full overflow-hidden bg-surface-container-highest">
+<img alt="User Profile" data-alt="User profile avatar with professional lighting and clean background" src="https://lh3.googleusercontent.com/aida-public/AB6AXuDKEiToMQaiDgoNEvH2-QJCZgyDpjHAGf6XoYnsZB_mYfy6UVamFlWQ_uLgufUFvxCgemW7jDyc3TES0v3CRkqd_vN3Nz6UMuMnJ6SL871RBl11XF7use49FV-XtD0wpTJVauBXfACJef-yxmUIDipSR_4HNzF-4eIkkLL74Ottob87-IOwP4X0MfBUC4zTS66nHKRRSk7yPLgYnHKrUmRr8DTUU0K_ImT6322livWJbYKJbzM-je4ZUPW4y0JyBOsIFO6fZ_imW5k"/>
+</div>
+</div>
+</header>
+<div class="flex">
+<!-- SideNavBar -->
+<aside class="fixed left-0 top-0 h-full flex flex-col pt-20 pb-6 px-4 h-screen w-64 bg-slate-50 dark:bg-slate-950 transition-all duration-200 ease-in-out">
+<div class="flex items-center gap-3 px-4 mb-8">
+<div class="w-10 h-10 rounded-lg bg-primary flex items-center justify-center text-white">
+<span class="material-symbols-outlined" data-icon="hub">hub</span>
+</div>
+<div>
+<h3 class="font-bold text-slate-900 dark:text-white leading-tight">Global Network</h3>
+<p class="text-[10px] text-secondary font-bold uppercase tracking-widest">Operational</p>
+</div>
+</div>
+<nav class="flex-1 space-y-1">
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-lg transition-all" href="#">
+<span class="material-symbols-outlined" data-icon="dashboard">dashboard</span>
+<span>Overview</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-lg transition-all" href="#">
+<span class="material-symbols-outlined" data-icon="hub">hub</span>
+<span>Topology</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-lg transition-all" href="#">
+<span class="material-symbols-outlined" data-icon="router">router</span>
+<span>Devices</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-lg transition-all" href="#">
+<span class="material-symbols-outlined" data-icon="monitor_heart">monitor_heart</span>
+<span>Health</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-blue-700 dark:text-blue-300 bg-blue-50/50 dark:bg-blue-900/20 rounded-lg font-semibold transition-all" href="#">
+<span class="material-symbols-outlined" data-icon="psychology">psychology</span>
+<span>AI Insights</span>
+</a>
+</nav>
+<div class="pt-4 mt-4 border-t border-slate-200 dark:border-slate-800 space-y-1">
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-lg transition-all" href="#">
+<span class="material-symbols-outlined" data-icon="help">help</span>
+<span>Support</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-lg transition-all" href="#">
+<span class="material-symbols-outlined" data-icon="description">description</span>
+<span>Documentation</span>
+</a>
+</div>
+</aside>
+<!-- Main Content Area -->
+<main class="ml-64 flex-1 p-8">
+<div class="max-w-6xl mx-auto">
+<!-- Page Header -->
+<div class="mb-10 flex items-end justify-between">
+<div>
+<div class="flex items-center gap-2 mb-2">
+<div class="w-2 h-2 rounded-full bg-secondary"></div>
+<span class="text-[10px] font-bold tracking-widest uppercase text-on-surface-variant">System Status: Optimal</span>
+</div>
+<h1 class="text-4xl font-extrabold tracking-tight text-on-surface mb-2">AI Insights Panel</h1>
+<p class="text-on-surface-variant max-w-lg">Advanced neural analysis of your global infrastructure. Proactive risk mitigation and automated optimization suggestions.</p>
+</div>
+<div class="flex gap-3">
+<button class="px-5 py-2.5 bg-surface-container-highest text-on-surface font-semibold rounded-lg hover:bg-surface-container-high transition-all text-sm flex items-center gap-2">
+<span class="material-symbols-outlined text-lg" data-icon="history">history</span>
+                            Audit Log
+                        </button>
+<button class="px-5 py-2.5 bg-gradient-to-br from-primary to-primary-container text-white font-semibold rounded-lg shadow-sm active:scale-95 transition-all text-sm flex items-center gap-2">
+<span class="material-symbols-outlined text-lg" data-icon="bolt">bolt</span>
+                            Re-scan Network
+                        </button>
+</div>
+</div>
+<div class="grid grid-cols-12 gap-6">
+<!-- Summary Card (Bento Style) -->
+<div class="col-span-12 lg:col-span-8 space-y-6">
+<section class="bg-surface-container-lowest p-8 rounded-xl shadow-[0px_24px_48px_rgba(33,37,41,0.04)] relative overflow-hidden group">
+<div class="absolute top-0 right-0 w-64 h-64 bg-secondary/5 rounded-full -mr-20 -mt-20 blur-3xl group-hover:bg-secondary/10 transition-colors"></div>
+<div class="relative z-10">
+<div class="flex items-center gap-3 mb-6">
+<div class="p-2 bg-secondary/10 rounded-lg">
+<span class="material-symbols-outlined text-secondary" data-icon="auto_awesome">auto_awesome</span>
+</div>
+<h2 class="text-xl font-bold tracking-tight">Executive Summary</h2>
+</div>
+<div class="space-y-4">
+<p class="text-lg leading-relaxed text-on-surface/90 font-light">
+                                        The network is currently operating at <span class="text-secondary font-bold">98.4% efficiency</span>. 
+                                        AI models have detected a <span class="text-error font-medium underline underline-offset-4 decoration-error/30">potential throughput bottleneck</span> in the North-East edge cluster caused by redundant routing protocols.
+                                    </p>
+<div class="flex flex-wrap gap-4 mt-6">
+<div class="bg-surface-container-low px-4 py-3 rounded-lg border-l-4 border-secondary">
+<p class="text-[10px] uppercase font-bold text-on-surface-variant mb-1">Risk Score</p>
+<p class="text-2xl font-extrabold text-on-surface">12<span class="text-sm font-medium text-on-surface-variant ml-1">/100</span></p>
+</div>
+<div class="bg-surface-container-low px-4 py-3 rounded-lg border-l-4 border-primary">
+<p class="text-[10px] uppercase font-bold text-on-surface-variant mb-1">Nodes Analyzed</p>
+<p class="text-2xl font-extrabold text-on-surface">1,248</p>
+</div>
+<div class="bg-surface-container-low px-4 py-3 rounded-lg border-l-4 border-tertiary-container">
+<p class="text-[10px] uppercase font-bold text-on-surface-variant mb-1">Remediations Ready</p>
+<p class="text-2xl font-extrabold text-on-surface">3</p>
+</div>
+</div>
+</div>
+</div>
+</section>
+<!-- Risk Detection Grid -->
+<div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+<!-- Risk 1 -->
+<div class="bg-surface-container-lowest p-6 rounded-xl shadow-sm border border-transparent hover:border-error/10 transition-all">
+<div class="flex justify-between items-start mb-4">
+<div class="w-10 h-10 rounded-full bg-error/10 flex items-center justify-center text-error">
+<span class="material-symbols-outlined" data-icon="report">report</span>
+</div>
+<span class="bg-error/10 text-error text-[10px] font-bold px-2 py-1 rounded">CRITICAL</span>
+</div>
+<h3 class="text-lg font-bold mb-2">BGP Route Flap</h3>
+<p class="text-sm text-on-surface-variant leading-relaxed mb-6">
+                                    AS-65001 is experiencing intermittent connectivity loss every 120 seconds. Automated analysis suggests a misconfigured dampening timer.
+                                </p>
+<div class="flex items-center gap-3">
+<button class="flex-1 py-2 bg-error text-white text-xs font-bold rounded-lg hover:opacity-90 transition-all uppercase tracking-wider">Isolate Node</button>
+<button class="p-2 border border-outline-variant rounded-lg hover:bg-surface-container-low transition-all">
+<span class="material-symbols-outlined text-sm" data-icon="more_vert">more_vert</span>
+</button>
+</div>
+</div>
+<!-- Risk 2 -->
+<div class="bg-surface-container-lowest p-6 rounded-xl shadow-sm border border-transparent hover:border-secondary/10 transition-all">
+<div class="flex justify-between items-start mb-4">
+<div class="w-10 h-10 rounded-full bg-secondary/10 flex items-center justify-center text-secondary">
+<span class="material-symbols-outlined" data-icon="warning">warning</span>
+</div>
+<span class="bg-secondary/10 text-secondary text-[10px] font-bold px-2 py-1 rounded">ADVISORY</span>
+</div>
+<h3 class="text-lg font-bold mb-2">Redundant Firewall Rules</h3>
+<p class="text-sm text-on-surface-variant leading-relaxed mb-6">
+                                    14 rules in the 'Edge-Finance' group haven't seen traffic in 90 days. Deleting them will reduce inspection latency by 4ms.
+                                </p>
+<div class="flex items-center gap-3">
+<button class="flex-1 py-2 bg-secondary text-white text-xs font-bold rounded-lg hover:opacity-90 transition-all uppercase tracking-wider">Automate Purge</button>
+<button class="p-2 border border-outline-variant rounded-lg hover:bg-surface-container-low transition-all">
+<span class="material-symbols-outlined text-sm" data-icon="visibility">visibility</span>
+</button>
+</div>
+</div>
+</div>
+</div>
+<!-- Remediation Actions Sidebar -->
+<div class="col-span-12 lg:col-span-4 space-y-6">
+<section class="glass-card p-6 rounded-xl shadow-[0px_24px_48px_rgba(33,37,41,0.06)] border border-outline-variant/15">
+<h2 class="text-sm font-bold uppercase tracking-widest text-on-surface-variant mb-6">Suggested Actions</h2>
+<div class="space-y-4">
+<!-- Remediation Item 1 -->
+<div class="p-4 rounded-lg bg-surface-container-low/50 hover:bg-surface-container-low transition-colors group">
+<div class="flex items-start gap-3">
+<div class="w-8 h-8 rounded-full bg-white flex items-center justify-center shrink-0 border border-slate-100">
+<span class="material-symbols-outlined text-primary text-lg" data-icon="memory">memory</span>
+</div>
+<div>
+<h4 class="text-sm font-bold text-on-surface group-hover:text-primary transition-colors">Balance Traffic</h4>
+<p class="text-[11px] text-on-surface-variant leading-tight mt-1">Shift 15% load from Cluster A to B to prevent saturation.</p>
+<button class="mt-3 text-[10px] font-extrabold uppercase text-primary tracking-tighter hover:underline">Apply patch now</button>
+</div>
+</div>
+</div>
+<!-- Remediation Item 2 -->
+<div class="p-4 rounded-lg bg-surface-container-low/50 hover:bg-surface-container-low transition-colors group">
+<div class="flex items-start gap-3">
+<div class="w-8 h-8 rounded-full bg-white flex items-center justify-center shrink-0 border border-slate-100">
+<span class="material-symbols-outlined text-secondary text-lg" data-icon="security">security</span>
+</div>
+<div>
+<h4 class="text-sm font-bold text-on-surface group-hover:text-secondary transition-colors">Secure Port 8080</h4>
+<p class="text-[11px] text-on-surface-variant leading-tight mt-1">Found unprotected debug port in staging vlan.</p>
+<button class="mt-3 text-[10px] font-extrabold uppercase text-secondary tracking-tighter hover:underline">Close port</button>
+</div>
+</div>
+</div>
+<!-- Remediation Item 3 -->
+<div class="p-4 rounded-lg bg-surface-container-low/50 hover:bg-surface-container-low transition-colors group">
+<div class="flex items-start gap-3">
+<div class="w-8 h-8 rounded-full bg-white flex items-center justify-center shrink-0 border border-slate-100">
+<span class="material-symbols-outlined text-tertiary text-lg" data-icon="cloud_sync">cloud_sync</span>
+</div>
+<div>
+<h4 class="text-sm font-bold text-on-surface group-hover:text-on-surface transition-colors">OSPF Re-convergence</h4>
+<p class="text-[11px] text-on-surface-variant leading-tight mt-1">Optimize timers for faster failure recovery.</p>
+<button class="mt-3 text-[10px] font-extrabold uppercase text-on-surface-variant tracking-tighter hover:underline">Review configuration</button>
+</div>
+</div>
+</div>
+</div>
+<div class="mt-8 pt-6 border-t border-outline-variant/20">
+<div class="flex justify-between items-center mb-4">
+<span class="text-xs font-bold text-on-surface-variant">Automation Confidence</span>
+<span class="text-xs font-bold text-secondary">92%</span>
+</div>
+<div class="w-full h-1.5 bg-surface-container-high rounded-full overflow-hidden">
+<div class="h-full bg-secondary w-[92%]"></div>
+</div>
+</div>
+</section>
+<!-- Live Visual Feed -->
+<div class="rounded-xl overflow-hidden h-48 relative shadow-sm">
+<img alt="Network Visualization" class="w-full h-full object-cover" data-alt="Futuristic digital network map with glowing nodes and data connection lines in dark blue and teal colors" src="https://lh3.googleusercontent.com/aida-public/AB6AXuC7TbCcCWU-uhymqiDogAYU9T9hYrnLpNkLaxLDbacuIxsuXADgPYp27GQyjgvm2yN0HgZbS0cmrwNj_kwj5AU_mDAlmVR3ejLYND1bwnNzSdjin0Sbh-dEk8x4-w71gx1jA0O2s5hA7t6tGk6vrT_02Md0Fe3NqB0BhzCZd8nlWi83PxcTFUY3rZBtiL4S8IFZnuU9Fw10e62IDlIrV_mn8Ql_UGbtuVoCxZmKal5modo4yQPrOQQmHXKuRITfhUTlwmaeqHZOUMc"/>
+<div class="absolute inset-0 bg-gradient-to-t from-slate-900/80 to-transparent flex flex-col justify-end p-4">
+<p class="text-[10px] text-secondary font-bold uppercase tracking-widest">Live Topology Analysis</p>
+<p class="text-white font-bold text-sm">Nodes processing... 94% complete</p>
+</div>
+</div>
+</div>
+</div>
+<!-- Anomalies Timeline (Asymmetric Layout) -->
+<section class="mt-12">
+<div class="flex items-center gap-4 mb-8">
+<h2 class="text-2xl font-extrabold tracking-tight">Anomalies Timeline</h2>
+<div class="h-px flex-1 bg-surface-container-high"></div>
+</div>
+<div class="flex flex-col gap-4">
+<div class="grid grid-cols-12 gap-4 items-center">
+<div class="col-span-2 text-right">
+<p class="text-xs font-bold text-on-surface-variant">14:24 PM</p>
+</div>
+<div class="col-span-1 flex justify-center">
+<div class="w-3 h-3 rounded-full bg-error"></div>
+</div>
+<div class="col-span-9 bg-surface-container-low p-4 rounded-lg flex justify-between items-center group hover:bg-surface-container-highest transition-all">
+<div>
+<h5 class="text-sm font-bold">Unauthorized API Access Attempt</h5>
+<p class="text-xs text-on-surface-variant">Origin: 192.168.1.45. AI blocked request and flagged MAC address.</p>
+</div>
+<span class="material-symbols-outlined text-outline-variant opacity-0 group-hover:opacity-100 transition-opacity" data-icon="chevron_right">chevron_right</span>
+</div>
+</div>
+<div class="grid grid-cols-12 gap-4 items-center">
+<div class="col-span-2 text-right">
+<p class="text-xs font-bold text-on-surface-variant">12:08 PM</p>
+</div>
+<div class="col-span-1 flex justify-center relative">
+<div class="w-3 h-3 rounded-full bg-primary"></div>
+</div>
+<div class="col-span-6 bg-surface-container-low p-4 rounded-lg flex justify-between items-center group hover:bg-surface-container-highest transition-all">
+<div>
+<h5 class="text-sm font-bold">Route Optimization Complete</h5>
+<p class="text-xs text-on-surface-variant">Successfully redirected 4.2TB of traffic away from congested link L4.</p>
+</div>
+</div>
+</div>
+<div class="grid grid-cols-12 gap-4 items-center">
+<div class="col-span-2 text-right">
+<p class="text-xs font-bold text-on-surface-variant">09:12 AM</p>
+</div>
+<div class="col-span-1 flex justify-center">
+<div class="w-3 h-3 rounded-full bg-secondary"></div>
+</div>
+<div class="col-span-7 bg-secondary/5 p-4 rounded-lg border border-secondary/10 flex justify-between items-center group hover:bg-secondary/10 transition-all">
+<div>
+<h5 class="text-sm font-bold text-secondary">Proactive Patch Applied</h5>
+<p class="text-xs text-secondary/80">Zero-day vulnerability CVE-2024-X patched across all core routers.</p>
+</div>
+</div>
+</div>
+</div>
+</section>
+</div>
+</main>
+</div>
+</body></html>

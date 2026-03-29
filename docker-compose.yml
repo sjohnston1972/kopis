@@ -1,0 +1,121 @@
+# ──────────────────────────────────────────────────────────────
+# Kopis — Docker Compose
+# Services are added incrementally per the build sequence in
+# CLAUDE.md. This file starts with the Stitch MCP server;
+# PostgreSQL, ChromaDB, backend, and frontend will follow.
+# ──────────────────────────────────────────────────────────────
+
+networks:
+  net_core:
+    external: true
+
+services:
+  # ── PostgreSQL ─────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: kopis-postgres
+    restart: unless-stopped
+    networks:
+      - net_core
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-kopis}
+      POSTGRES_USER: ${POSTGRES_USER:-kopis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - kopis-pgdata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kopis}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── ChromaDB ───────────────────────────────────────────────
+  chromadb:
+    image: chromadb/chroma:0.6.3
+    container_name: kopis-chromadb
+    restart: unless-stopped
+    networks:
+      - net_core
+    volumes:
+      - kopis-chromadata:/chroma/chroma
+    ports:
+      - "8101:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend API ────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: kopis-backend
+    restart: unless-stopped
+    networks:
+      - net_core
+    ports:
+      - "8200:8000"
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: kopis-postgres
+      POSTGRES_PORT: 5432
+      CHROMADB_HOST: kopis-chromadb
+      CHROMADB_PORT: 8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Frontend (React + nginx) ────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    container_name: kopis-frontend
+    restart: unless-stopped
+    networks:
+      - net_core
+    ports:
+      - "8201:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Stitch MCP (Google Stitch design integration) ──────────
+  stitch-mcp:
+    build:
+      context: ./docker/stitch-mcp
+      dockerfile: Dockerfile
+    container_name: kopis-stitch-mcp
+    restart: unless-stopped
+    networks:
+      - net_core
+    environment:
+      - STITCH_API_KEY=${STITCH_API_KEY}
+    volumes:
+      - stitch-gcloud:/root/.config/gcloud
+    ports:
+      - "3334:3333"
+    stdin_open: true
+    tty: true
+
+volumes:
+  stitch-gcloud:
+  kopis-pgdata:
+  kopis-chromadata:
