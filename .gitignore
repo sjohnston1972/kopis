@@ -1,9 +1,28 @@
+# Secrets
 .env
 .mcp.json
+
+# Python
 __pycache__/
-*.pyc
+*.py[codz]
+*.so
 .venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+
+# Node / Frontend
 node_modules/
 frontend/node_modules/
-dist/
 frontend/dist/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
