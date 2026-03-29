@@ -18,7 +18,7 @@ log = structlog.get_logger()
 
 def _route_after_topology(state: KopisState) -> str:
     """Conditional edge: decide where to go after the topology agent."""
-    if state.get("escalate_to_opus"):
+    if state.get("force_escalation") or state.get("escalate_to_opus"):
         return "escalation"
     stage = state.get("processing_stage", "complete")
     if stage == "remediation":
@@ -77,6 +77,7 @@ async def run_pipeline(
     device_hostname: str,
     device_platform: str,
     raw_snapshot: dict,
+    force_escalation: bool = False,
 ) -> KopisState:
     """Execute the full LangGraph pipeline for a single device snapshot.
 
@@ -103,6 +104,7 @@ async def run_pipeline(
         "findings": [],
         "recommendations": [],
         "escalate_to_opus": False,
+        "force_escalation": force_escalation,
         "processing_stage": "normalise",
         "errors": [],
         "tokens_used": {},
@@ -113,10 +115,36 @@ async def run_pipeline(
     # Run the graph
     final_state = await pipeline.ainvoke(initial_state)
 
-    # Persist findings
+    # Clear any existing findings for this snapshot (handles re-runs and escalations)
+    from sqlalchemy import select as sa_select
+
+    existing_findings = await db.execute(
+        sa_select(Finding).where(Finding.snapshot_id == snapshot_id)
+    )
+    for old_finding in existing_findings.scalars().all():
+        # Delete linked recommendations → approvals first
+        old_recs = await db.execute(
+            sa_select(Recommendation).where(Recommendation.finding_id == old_finding.id)
+        )
+        for old_rec in old_recs.scalars().all():
+            old_apprs = await db.execute(
+                sa_select(Approval).where(Approval.recommendation_id == old_rec.id)
+            )
+            for old_appr in old_apprs.scalars().all():
+                await db.delete(old_appr)
+            await db.delete(old_rec)
+        await db.delete(old_finding)
+    await db.flush()
+
+    # Persist findings — remap AI-generated IDs to real UUIDs
+    finding_id_map: dict[str, str] = {}  # old_id → new_id
     for f in final_state.get("findings", []):
+        old_id = f.get("id", "")
+        finding_id = str(uuid.uuid4())
+        finding_id_map[old_id] = finding_id
+        f["id"] = finding_id
         finding = Finding(
-            id=f.get("id", str(uuid.uuid4())),
+            id=finding_id,
             snapshot_id=snapshot_id,
             device_id=device_id,
             category=f.get("category", "unknown"),
@@ -142,10 +170,13 @@ async def run_pipeline(
     }
 
     for r in final_state.get("recommendations", []):
-        rec_id = r.get("id", str(uuid.uuid4()))
+        rec_id = str(uuid.uuid4())
+        # Remap AI-generated finding_id to the real UUID we assigned
+        raw_finding_id = r.get("finding_id", "")
+        real_finding_id = finding_id_map.get(raw_finding_id, raw_finding_id)
         rec = Recommendation(
             id=rec_id,
-            finding_id=r.get("finding_id", ""),
+            finding_id=real_finding_id,
             action_description=r.get("action", ""),
             commands=r.get("commands", []),
             rollback_commands=r.get("rollback_commands", []),
@@ -160,7 +191,7 @@ async def run_pipeline(
         approval = Approval(recommendation_id=rec_id, status="pending")
 
         # Create Jira service request
-        linked_finding = finding_lookup.get(r.get("finding_id", ""), {})
+        linked_finding = finding_lookup.get(real_finding_id, finding_lookup.get(raw_finding_id, {}))
         jira_result = await jira_client.create_service_request(
             title=linked_finding.get("title", r.get("action", "Remediation")),
             description=r.get("reasoning", ""),

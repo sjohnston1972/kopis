@@ -1,19 +1,23 @@
 """Approval queue endpoints."""
 
+import asyncio
+
+import structlog
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.postgres import get_db
+from db.postgres import get_db, async_session
 from models.approval import ApprovalAction, ApprovalDetail
 from services import approval_service
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
+log = structlog.get_logger()
 
 
 @router.get("", response_model=list[ApprovalDetail])
 async def list_approvals(db: AsyncSession = Depends(get_db)):
-    """List all pending approvals with full context."""
-    return await approval_service.list_pending(db)
+    """List all pending and executing approvals with full context."""
+    return await approval_service.list_active(db)
 
 
 @router.post("/{approval_id}/approve", response_model=ApprovalDetail)
@@ -48,7 +52,25 @@ async def approve(
 
     await slack_client.notify_approval_update(approval, "approved")
 
+    # Auto-trigger execution in background
+    asyncio.create_task(_execute_background(approval_id))
+
     return (await approval_service._enrich_approval(db, approval))
+
+
+async def _execute_background(approval_id: str):
+    """Execute the approved remediation in the background."""
+    async with async_session() as db:
+        try:
+            from services.execution_engine import execute_approved
+
+            result = await execute_approved(db, approval_id)
+            if result.get("error"):
+                log.error("auto_execution_failed", approval_id=approval_id, error=result["error"])
+            else:
+                log.info("auto_execution_complete", approval_id=approval_id)
+        except Exception as e:
+            log.error("auto_execution_error", approval_id=approval_id, error=str(e))
 
 
 @router.post("/{approval_id}/deny", response_model=ApprovalDetail)

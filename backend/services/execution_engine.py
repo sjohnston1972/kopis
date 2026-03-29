@@ -65,8 +65,9 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
         command_count=len(commands),
     )
 
-    # Execute via pyATS/Netmiko
-    result = await _send_commands(device, commands)
+    # Execute via pyATS/Netmiko (blocking — run in thread)
+    import asyncio
+    result = await asyncio.to_thread(_send_commands_sync, device, commands)
 
     # Update approval record
     success = not result.get("error")
@@ -103,8 +104,8 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
     return result
 
 
-async def _send_commands(device, commands: list[str]) -> dict:
-    """Connect to a device and send commands.
+def _send_commands_sync(device, commands: list[str]) -> dict:
+    """Connect to a device and send commands (blocking — run via asyncio.to_thread).
 
     Uses pyATS Unicon if available, falls back to a dry-run mode.
     """
@@ -133,18 +134,10 @@ async def _send_commands(device, commands: list[str]) -> dict:
             try:
                 output = tb_device.execute(cmd, timeout=settings.pyats_command_timeout)
                 outputs.append({"command": cmd, "output": output, "success": True})
-                log.info("command_sent", hostname=device.hostname, command=cmd)
             except Exception as e:
                 outputs.append(
                     {"command": cmd, "output": str(e), "success": False}
                 )
-                log.error(
-                    "command_failed",
-                    hostname=device.hostname,
-                    command=cmd,
-                    error=str(e),
-                )
-                # Stop executing on failure
                 break
 
         try:
@@ -153,7 +146,6 @@ async def _send_commands(device, commands: list[str]) -> dict:
             pass
 
     except ImportError:
-        log.warning("pyats_not_available", mode="dry_run")
         for cmd in commands:
             outputs.append(
                 {"command": cmd, "output": "[DRY RUN] pyATS not installed", "success": True}

@@ -132,7 +132,8 @@ class SlackClient:
         cmd_preview = ""
         if commands:
             cmd_list = commands[:5] if isinstance(commands[0], str) else [str(c) for c in commands[:5]]
-            cmd_preview = f"\n```\n{'\\n'.join(cmd_list)}\n```"
+            joined = "\n".join(cmd_list)
+            cmd_preview = f"\n```\n{joined}\n```"
             if len(commands) > 5:
                 cmd_preview += f"\n_...and {len(commands) - 5} more command(s)_"
 

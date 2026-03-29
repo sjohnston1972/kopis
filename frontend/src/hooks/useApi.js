@@ -8,7 +8,12 @@ export function useApi(apiFn, deps = []) {
   const refetch = useCallback(() => {
     setLoading(true);
     setError(null);
-    apiFn()
+    const result = apiFn();
+    if (!result || typeof result.then !== 'function') {
+      setLoading(false);
+      return;
+    }
+    result
       .then(setData)
       .catch(setError)
       .finally(() => setLoading(false));

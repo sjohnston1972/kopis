@@ -313,9 +313,10 @@ export default function Topology() {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [showLabels, setShowLabels] = useState(false);
-  const [filterType, setFilterType] = useState('all');
+  const [filterType, setFilterType] = useState('bgp');
   const [mode, setMode] = useState('pointer'); // 'pointer' | 'select'
   const svgRef = useRef(null);
+  const containerRef = useRef(null);
   const isPanning = useRef(false);
   const lastMouse = useRef({ x: 0, y: 0 });
 
@@ -328,63 +329,59 @@ export default function Topology() {
     : edges.filter((e) => e.type === filterType);
 
   // Layout — initialize from auto-layout, then allow dragging
-  const STORAGE_KEY = 'kopis-topology-positions';
-  const ZONES_KEY = 'kopis-topology-zones';
-  const initialPositions = useMemo(() => layoutNodes(nodes, filteredEdges), [nodes, filteredEdges]);
+  // Layout is always computed from ALL edges — changing the filter should not reposition nodes
+  const initialPositions = useMemo(() => layoutNodes(nodes, edges), [nodes, edges]);
   const [positions, setPositions] = useState({});
   const [selectedIds, setSelectedIds] = useState(new Set());
   const [selRect, setSelRect] = useState(null); // { x1,y1,x2,y2 } in SVG coords
-  const [zones, setZones] = useState(() => {
-    try { return JSON.parse(localStorage.getItem(ZONES_KEY)) || []; } catch { return []; }
-  }); // [{ id, x, y, w, h, label, color }]
+  const [zones, setZones] = useState([]); // [{ id, x, y, w, h, label, color }]
   const [editingZone, setEditingZone] = useState(null); // zone id being label-edited
   const dragging = useRef(null); // { id, startX, startY, origins: {id: {x,y}} }
   const selecting = useRef(null); // { startClientX, startClientY }
   const drawingZone = useRef(null); // { x1, y1 } in SVG coords
+  const serverLayout = useRef(null); // loaded layout from API
+  const layoutReady = useRef(false); // prevents saving before initial load completes
+  const userModified = useRef(false); // true once user drags a node or edits zones
+
+  // Load saved layout from server on mount
+  useEffect(() => {
+    api.topologyLayout().then((data) => {
+      serverLayout.current = data;
+      if (data.zones?.length) setZones(data.zones);
+      layoutReady.current = true;
+    }).catch(() => { layoutReady.current = true; });
+  }, []);
 
   // Sync positions when topology data changes, restoring saved positions
   useEffect(() => {
-    let saved = {};
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) saved = JSON.parse(raw);
-    } catch {}
-
-    setPositions((prev) => {
+    const saved = serverLayout.current?.positions || {};
+    setPositions(() => {
       const next = { ...initialPositions };
-      // Restore saved dragged positions for nodes that still exist
       for (const id in saved) {
         if (next[id]) {
           next[id] = { ...saved[id], _dragged: true };
-        }
-      }
-      // Also preserve in-session dragged positions
-      for (const id in prev) {
-        if (next[id] && prev[id]._dragged) {
-          next[id] = prev[id];
         }
       }
       return next;
     });
   }, [initialPositions]);
 
-  // Persist dragged positions to localStorage
+  // Debounced save to server when positions or zones change (only after user interaction)
+  const saveTimer = useRef(null);
   useEffect(() => {
-    const dragged = {};
-    for (const id in positions) {
-      if (positions[id]._dragged) {
-        dragged[id] = { x: positions[id].x, y: positions[id].y };
+    if (!layoutReady.current || !userModified.current) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      const dragged = {};
+      for (const id in positions) {
+        if (positions[id]._dragged) {
+          dragged[id] = { x: positions[id].x, y: positions[id].y };
+        }
       }
-    }
-    if (Object.keys(dragged).length > 0) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(dragged));
-    }
-  }, [positions]);
-
-  // Persist zones to localStorage
-  useEffect(() => {
-    localStorage.setItem(ZONES_KEY, JSON.stringify(zones));
-  }, [zones]);
+      api.saveTopologyLayout({ positions: dragged, zones }).catch(() => {});
+    }, 1000);
+    return () => clearTimeout(saveTimer.current);
+  }, [positions, zones]);
 
   // Calculate SVG viewBox from positions
   const viewBox = useMemo(() => {
@@ -398,6 +395,30 @@ export default function Topology() {
     const maxY = Math.max(...ys) + pad + 50;
     return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
   }, [positions]);
+
+  // Zoom-to-fit on initial load
+  const hasFitted = useRef(false);
+  useEffect(() => {
+    if (hasFitted.current) return;
+    const container = containerRef.current;
+    if (!container || Object.keys(positions).length === 0) return;
+    hasFitted.current = true;
+    requestAnimationFrame(() => {
+      const rect = container.getBoundingClientRect();
+      const cw = rect.width;
+      const ch = rect.height;
+      if (!cw || !ch || !viewBox.w || !viewBox.h) return;
+      const scaleX = cw / viewBox.w;
+      const scaleY = ch / viewBox.h;
+      const fitZoom = Math.min(scaleX, scaleY, 1.5) * 0.9; // 90% to add breathing room, cap at 1.5x
+      const contentCx = viewBox.x + viewBox.w / 2;
+      const contentCy = viewBox.y + viewBox.h / 2;
+      const fitPanX = cw / 2 - contentCx * fitZoom;
+      const fitPanY = ch / 2 - contentCy * fitZoom;
+      setZoom(fitZoom);
+      setPan({ x: fitPanX, y: fitPanY });
+    });
+  }, [positions, viewBox]);
 
   // All interaction state is stored in refs to avoid stale closures.
   // A single forceUpdate counter triggers re-renders when needed.
@@ -416,7 +437,6 @@ export default function Topology() {
   }, []);
 
   // Single effect to manage all canvas mouse interaction via the container div
-  const containerRef = useRef(null);
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -429,19 +449,24 @@ export default function Topology() {
 
     const onMouseDown = (e) => {
       if (e.button !== 0 || dragging.current) return;
-      const { mode: m } = stateRef.current;
-      if (m === 'select') {
-        const pt = getSvgPt(e.clientX, e.clientY);
-        selecting.current = true;
-        setSelRect({ x1: pt.x, y1: pt.y, x2: pt.x, y2: pt.y });
-      } else if (m === 'zone') {
-        const pt = getSvgPt(e.clientX, e.clientY);
-        drawingZone.current = true;
-        setSelRect({ x1: pt.x, y1: pt.y, x2: pt.x, y2: pt.y });
-      } else {
-        isPanning.current = true;
-        lastMouse.current = { x: e.clientX, y: e.clientY };
-      }
+      // Defer so React synthetic onMouseDown on nodes can set dragging.current first
+      const clientX = e.clientX, clientY = e.clientY;
+      requestAnimationFrame(() => {
+        if (dragging.current) return; // node drag won the race
+        const { mode: m } = stateRef.current;
+        if (m === 'select') {
+          const pt = getSvgPt(clientX, clientY);
+          selecting.current = true;
+          setSelRect({ x1: pt.x, y1: pt.y, x2: pt.x, y2: pt.y });
+        } else if (m === 'zone') {
+          const pt = getSvgPt(clientX, clientY);
+          drawingZone.current = true;
+          setSelRect({ x1: pt.x, y1: pt.y, x2: pt.x, y2: pt.y });
+        } else {
+          isPanning.current = true;
+          lastMouse.current = { x: clientX, y: clientY };
+        }
+      });
     };
 
     const onMouseMove = (e) => {
@@ -454,7 +479,7 @@ export default function Topology() {
           const next = { ...prev };
           d.ids.forEach((id) => {
             const orig = d.origins[id];
-            if (orig) next[id] = { x: orig.x + dx, y: orig.y + dy, _dragged: true };
+            if (orig) { next[id] = { x: orig.x + dx, y: orig.y + dy, _dragged: true }; userModified.current = true; }
           });
           return next;
         });
@@ -491,6 +516,7 @@ export default function Topology() {
             color: ZONE_COLORS[zs.length % ZONE_COLORS.length],
           };
           setZones((prev) => [...prev, newZone]);
+          userModified.current = true;
           setEditingZone(newZone.id);
         }
         drawingZone.current = null;
@@ -542,7 +568,7 @@ export default function Topology() {
 
   const handleZoomIn = () => setZoom((z) => Math.min(z + 0.2, 2.5));
   const handleZoomOut = () => setZoom((z) => Math.max(z - 0.2, 0.3));
-  const handleReset = () => { setZoom(1); setPan({ x: 0, y: 0 }); setPositions(initialPositions); localStorage.removeItem(STORAGE_KEY); setZones([]); localStorage.removeItem(ZONES_KEY); };
+  const handleReset = () => { setZoom(1); setPan({ x: 0, y: 0 }); setPositions(initialPositions); setZones([]); api.saveTopologyLayout({ positions: {}, zones: [] }).catch(() => {}); };
 
   // Edge counts per node
   const edgeCounts = {};
@@ -561,7 +587,7 @@ export default function Topology() {
       {/* Canvas */}
       <div ref={containerRef} className="flex-1 relative bg-surface-container-low topology-grid overflow-hidden" style={{ isolation: 'isolate' }}>
         {/* Toolbar */}
-        <div className="absolute top-4 left-4 z-20 glass-panel rounded-xl shadow-lg border border-outline-variant/30 flex flex-col gap-0.5 p-1.5">
+        <div className="absolute top-4 left-4 z-20 bg-surface/95 rounded-xl shadow-lg border border-outline-variant/30 flex flex-col gap-0.5 p-1.5">
           <ToolbarButton icon="zoom_in" onClick={handleZoomIn} label="Zoom in" />
           <ToolbarButton icon="zoom_out" onClick={handleZoomOut} label="Zoom out" />
           <div className="h-px bg-outline-variant/40 mx-1.5 my-0.5" />
@@ -575,7 +601,7 @@ export default function Topology() {
         </div>
 
         {/* Stats bar */}
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 glass-panel rounded-full shadow-md border border-outline-variant/30 px-5 py-2 flex items-center gap-4">
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 bg-surface/95 rounded-full shadow-md border border-outline-variant/30 px-5 py-2 flex items-center gap-4">
           <div className="flex items-center gap-1.5">
             <span className="w-2 h-2 rounded-full bg-secondary animate-pulse" />
             <span className="text-xs font-bold text-on-surface">{nodes.length} Devices</span>
@@ -602,7 +628,7 @@ export default function Topology() {
               className={`px-3 py-1 rounded-full text-[11px] font-bold transition-all ${
                 filterType === t
                   ? 'bg-primary text-on-primary shadow-sm'
-                  : 'glass-panel text-on-surface-variant hover:bg-outline-variant/20 border border-outline-variant/30'
+                  : 'bg-surface/95 text-on-surface-variant hover:bg-outline-variant/20 border border-outline-variant/30'
               }`}
             >
               {t === 'all' ? 'All Links' : t === 'bgp' ? 'BGP Only' : 'Subnet Only'}
@@ -611,7 +637,7 @@ export default function Topology() {
         </div>
 
         {/* Legend */}
-        <div className="absolute bottom-4 left-4 z-10 glass-panel rounded-xl shadow-lg border border-outline-variant/30 px-4 py-3">
+        <div className="absolute bottom-4 left-4 z-10 bg-surface/95 rounded-xl shadow-lg border border-outline-variant/30 px-4 py-3">
           <p className="text-[10px] font-bold tracking-widest text-on-surface-variant uppercase mb-2">Legend</p>
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center gap-2">
@@ -675,6 +701,7 @@ export default function Topology() {
                       onBlur={(e) => {
                         const val = e.target.value.trim();
                         setZones((prev) => prev.map((z) => z.id === zone.id ? { ...z, label: val || zone.label } : z));
+                        userModified.current = true;
                         setEditingZone(null);
                       }}
                       onKeyDown={(e) => {
@@ -700,7 +727,7 @@ export default function Topology() {
                 <foreignObject x={zone.x + zone.w - 24} y={zone.y + 2} width={22} height={22}>
                   <div
                     className="w-5 h-5 rounded-full bg-white/80 border border-outline-variant/40 flex items-center justify-center shadow-sm cursor-pointer hover:bg-error/10 hover:border-error/40 transition-colors"
-                    onClick={(e) => { e.stopPropagation(); setZones((prev) => prev.filter((z) => z.id !== zone.id)); }}
+                    onClick={(e) => { e.stopPropagation(); setZones((prev) => prev.filter((z) => z.id !== zone.id)); userModified.current = true; }}
                     onMouseDown={(e) => e.stopPropagation()}
                   >
                     <Icon name="close" className="text-[12px] text-on-surface-variant" />

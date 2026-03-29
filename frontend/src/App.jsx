@@ -1,5 +1,6 @@
 import { Routes, Route } from 'react-router-dom';
 import Layout from './components/Layout';
+import { SnapshotProvider } from './hooks/useSnapshotStatus';
 import Dashboard from './pages/Dashboard';
 import Topology from './pages/Topology';
 import Devices from './pages/Devices';
@@ -11,6 +12,7 @@ import Settings from './pages/Settings';
 
 export default function App() {
   return (
+    <SnapshotProvider>
     <Routes>
       <Route element={<Layout />}>
         <Route index element={<Dashboard />} />
@@ -23,5 +25,6 @@ export default function App() {
         <Route path="settings" element={<Settings />} />
       </Route>
     </Routes>
+    </SnapshotProvider>
   );
 }

@@ -1,19 +1,19 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Outlet, useLocation } from 'react-router-dom';
 import Sidebar from './Sidebar';
 import TopNav from './TopNav';
+import ChatPanel from './ChatPanel';
+import Icon from './Icon';
 
 export default function Layout() {
   const { pathname } = useLocation();
   const mainRef = useRef(null);
+  const [chatState, setChatState] = useState('closed'); // 'closed' | 'minimized' | 'open'
 
-  // Force browser repaint after navigation — works around a compositor bug
-  // where GPU-accelerated layers (SVG, backdrop-filter) from the previous
-  // page can prevent the new content from visually appearing.
+  // Force browser repaint after navigation
   useEffect(() => {
     const el = mainRef.current;
     if (!el) return;
-    // Reading offsetHeight after toggling visibility forces a synchronous reflow+repaint
     el.style.willChange = 'contents';
     void el.offsetHeight;
     requestAnimationFrame(() => {
@@ -30,6 +30,18 @@ export default function Layout() {
           <Outlet key={pathname} />
         </main>
       </div>
+
+      {/* Chat FAB — visible when chat is fully closed */}
+      {chatState === 'closed' && (
+        <button
+          onClick={() => setChatState('open')}
+          className="fixed bottom-6 right-6 w-14 h-14 rounded-2xl bg-primary text-on-primary shadow-lg shadow-primary/30 flex items-center justify-center hover:scale-105 hover:shadow-xl transition-all z-50"
+        >
+          <Icon name="smart_toy" className="text-[24px]" />
+        </button>
+      )}
+
+      <ChatPanel state={chatState} onStateChange={setChatState} />
     </>
   );
 }

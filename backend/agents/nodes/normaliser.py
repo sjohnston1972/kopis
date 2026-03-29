@@ -70,6 +70,134 @@ Rules:
 """
 
 
+def _fallback_normalise(raw: dict, hostname: str, platform: str) -> dict:
+    """Extract key data directly from pyATS snapshot when Ollama is unavailable."""
+    interface_summary = []
+    anomalies = []
+    routing_summary = []
+
+    # Interfaces
+    interfaces = raw.get("interface", {})
+    if isinstance(interfaces, dict):
+        for name, idata in interfaces.items():
+            if not isinstance(idata, dict):
+                continue
+            oper = idata.get("oper_status", "unknown")
+            admin = idata.get("enabled", True)
+            ip_addr = None
+            ipv4 = idata.get("ipv4", {})
+            if isinstance(ipv4, dict):
+                for addr, info in ipv4.items():
+                    if isinstance(info, dict):
+                        prefix = info.get("prefix_length", "")
+                        ip_addr = f"{addr}/{prefix}" if prefix else addr
+                        break
+
+            in_errors = idata.get("counters", {}).get("in_errors", 0) if isinstance(idata.get("counters"), dict) else 0
+            out_errors = idata.get("counters", {}).get("out_errors", 0) if isinstance(idata.get("counters"), dict) else 0
+            in_crc = idata.get("counters", {}).get("in_crc_errors", 0) if isinstance(idata.get("counters"), dict) else 0
+
+            status = "up" if oper == "up" else ("admin-down" if not admin else "down")
+            interface_summary.append({
+                "name": name,
+                "status": status,
+                "ip_address": ip_addr,
+                "speed": idata.get("bandwidth", None),
+                "in_errors": in_errors,
+                "out_errors": out_errors,
+                "in_crc": in_crc,
+                "description": idata.get("description"),
+            })
+
+            if status == "down" and admin:
+                anomalies.append({
+                    "type": "interface_down",
+                    "entity": name,
+                    "detail": f"Interface {name} is operationally down but admin-up",
+                })
+            if in_errors > 100 or out_errors > 100:
+                anomalies.append({
+                    "type": "high_errors",
+                    "entity": name,
+                    "detail": f"Interface {name} has {in_errors} in_errors, {out_errors} out_errors",
+                })
+
+    # BGP
+    bgp = raw.get("bgp", {})
+    if isinstance(bgp, dict):
+        bgp_neighbors = []
+        for instance in bgp.get("instance", {}).values():
+            if not isinstance(instance, dict):
+                continue
+            for vrf in instance.get("vrf", {}).values():
+                if not isinstance(vrf, dict):
+                    continue
+                for neighbor_addr, ndata in vrf.get("neighbor", {}).items():
+                    if not isinstance(ndata, dict):
+                        continue
+                    session_state = ndata.get("session_state", "unknown")
+                    bgp_neighbors.append({"id": neighbor_addr, "state": session_state})
+                    if session_state != "Established":
+                        anomalies.append({
+                            "type": "missing_neighbour",
+                            "entity": f"BGP neighbor {neighbor_addr}",
+                            "detail": f"BGP neighbor {neighbor_addr} is in state {session_state} (not Established)",
+                        })
+        if bgp_neighbors:
+            routing_summary.append({
+                "protocol": "bgp",
+                "neighbours": bgp_neighbors,
+                "route_count": 0,
+                "areas": [],
+            })
+
+    # OSPF
+    ospf = raw.get("ospf", {})
+    if isinstance(ospf, dict):
+        ospf_neighbors = []
+        areas = set()
+        for instance in ospf.get("vrf", {}).values():
+            if not isinstance(instance, dict):
+                continue
+            for area_id, area_data in instance.get("areas", {}).items():
+                if not isinstance(area_data, dict):
+                    continue
+                areas.add(area_id)
+                for iface_data in area_data.get("interfaces", {}).values():
+                    if not isinstance(iface_data, dict):
+                        continue
+                    for nbr_id, nbr_data in iface_data.get("neighbors", {}).items():
+                        if isinstance(nbr_data, dict):
+                            state = nbr_data.get("state", "unknown")
+                            ospf_neighbors.append({"id": nbr_id, "state": state})
+        if ospf_neighbors:
+            routing_summary.append({
+                "protocol": "ospf",
+                "neighbours": ospf_neighbors,
+                "route_count": 0,
+                "areas": list(areas),
+            })
+
+    # Platform
+    plat = raw.get("platform", {})
+    platform_info = {}
+    if isinstance(plat, dict):
+        platform_info = {
+            "hostname": hostname,
+            "os": platform,
+            "version": plat.get("version") or plat.get("os", ""),
+            "uptime": str(plat.get("uptime", "")),
+            "serial": plat.get("chassis_sn") or plat.get("serial", None),
+        }
+
+    return {
+        "interface_summary": interface_summary,
+        "routing_summary": routing_summary,
+        "platform": platform_info,
+        "anomalies_detected": anomalies,
+    }
+
+
 async def normaliser_node(state: KopisState) -> dict:
     """LangGraph node: normalise raw snapshot data via Ollama."""
     hostname = state.get("device_hostname", "unknown")
@@ -91,14 +219,15 @@ async def normaliser_node(state: KopisState) -> dict:
             temperature=0.05,
         )
     except Exception as e:
-        log.error("normaliser_failed", hostname=hostname, error=str(e))
+        log.warning("normaliser_ollama_failed_using_fallback", hostname=hostname, error=str(e))
+        fallback = _fallback_normalise(raw, hostname, state.get("device_platform", "unknown"))
         return {
-            "normalised_data": {},
-            "interface_summary": [],
-            "routing_summary": [],
-            "anomalies_detected": [],
-            "processing_stage": "normalise",
-            "errors": state.get("errors", []) + [f"Normaliser failed: {e}"],
+            "normalised_data": fallback,
+            "interface_summary": fallback.get("interface_summary", []),
+            "routing_summary": fallback.get("routing_summary", []),
+            "anomalies_detected": fallback.get("anomalies_detected", []),
+            "processing_stage": "topology",
+            "errors": state.get("errors", []) + [f"Normaliser failed: {e} (used fallback)"],
             "tokens_used": state.get("tokens_used", {}),
         }
 

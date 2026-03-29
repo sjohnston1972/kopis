@@ -13,13 +13,21 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  // Health
+  // Health & Dashboard
   health: () => request('/health'),
   healthDeps: () => request('/health/dependencies'),
+  dashboardMetrics: () => request('/dashboard/metrics'),
 
   // Devices
   devices: () => request('/devices'),
   device: (id) => request(`/devices/${id}`),
+  deviceSnapshot: (id) => request(`/devices/${id}/snapshot`),
+  deviceUnmonitored: (id) => request(`/devices/${id}/unmonitored`),
+  setDeviceUnmonitored: (id, interfaces) =>
+    request(`/devices/${id}/unmonitored`, {
+      method: 'PUT',
+      body: JSON.stringify({ interfaces }),
+    }),
   refreshDevices: () => request('/devices/refresh', { method: 'POST' }),
 
   // Snapshots
@@ -27,6 +35,7 @@ export const api = {
     const qs = params ? '?' + new URLSearchParams(params).toString() : '';
     return request(`/snapshots${qs}`);
   },
+  snapshotStatus: () => request('/snapshots/status'),
   snapshot: (id) => request(`/snapshots/${id}`),
   snapshotDiff: (id) => request(`/snapshots/${id}/diff`),
   triggerSnapshot: (deviceId) =>
@@ -41,6 +50,8 @@ export const api = {
     return request(`/findings${qs}`);
   },
   finding: (id) => request(`/findings/${id}`),
+  dismissFinding: (id) => request(`/findings/${id}`, { method: 'DELETE' }),
+  escalateFinding: (id) => request(`/findings/${id}/escalate`, { method: 'POST' }),
 
   // Approvals
   approvals: () => request('/approvals'),
@@ -57,6 +68,16 @@ export const api = {
   // Execution
   execute: (approvalId) => request(`/execute/${approvalId}`, { method: 'POST' }),
 
+  // Chat (streaming — returns raw Response for SSE consumption)
+  chatStream: (messages, model) =>
+    fetch(`${API_BASE}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages, model }),
+    }),
+
   // Topology
   topology: () => request('/topology'),
+  topologyLayout: () => request('/topology/layout'),
+  saveTopologyLayout: (data) => request('/topology/layout', { method: 'PUT', body: JSON.stringify(data) }),
 };

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import Icon from '../components/Icon';
@@ -108,11 +108,293 @@ function formatTimeShort(dateStr) {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+/* ─── Finding Detail Modal ─── */
+function FindingDetailModal({ findingId, onClose, onDismiss, onEscalate }) {
+  const [detail, setDetail] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [acting, setActing] = useState(null);
+
+  useEffect(() => {
+    if (!findingId) { setDetail(null); return; }
+    setLoading(true);
+    setError(null);
+    api.finding(findingId)
+      .then(setDetail)
+      .catch(setError)
+      .finally(() => setLoading(false));
+  }, [findingId]);
+
+  if (!findingId) return null;
+
+  const handleDismiss = async () => {
+    setActing('dismiss');
+    try {
+      await api.dismissFinding(findingId);
+      onDismiss(findingId);
+      onClose();
+    } catch (e) {
+      alert(`Dismiss failed: ${e.message}`);
+    } finally {
+      setActing(null);
+    }
+  };
+
+  const handleEscalate = async () => {
+    setActing('escalate');
+    try {
+      await api.escalateFinding(findingId);
+      onEscalate(findingId);
+      onClose();
+    } catch (e) {
+      alert(`Escalate failed: ${e.message}`);
+    } finally {
+      setActing(null);
+    }
+  };
+
+  const f = detail || {};
+  const device = f.device || {};
+  const recs = f.recommendations || [];
+  const evidence = f.evidence || {};
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      {/* Backdrop */}
+      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+
+      {/* Modal */}
+      <div className="relative bg-surface-container-lowest rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] overflow-y-auto">
+        {/* Header */}
+        <div className="sticky top-0 bg-surface-container-lowest z-10 px-6 pt-6 pb-4 border-b border-outline/10">
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex-1 min-w-0">
+              {loading ? (
+                <div className="h-6 w-48 bg-surface-container-high rounded animate-pulse" />
+              ) : (
+                <>
+                  <div className="flex items-center gap-2 mb-2">
+                    <StatusChip variant={severityChipVariant(f.severity)} dot>
+                      {severityLabel(f.severity)}
+                    </StatusChip>
+                    {f.category && (
+                      <span className="text-[10px] font-medium text-on-surface-variant bg-surface-container-high px-2 py-0.5 rounded-full uppercase">
+                        {f.category}
+                      </span>
+                    )}
+                    {f.agent_model && (
+                      <span className="text-[10px] font-mono text-on-surface-variant/60">
+                        {f.agent_model}
+                      </span>
+                    )}
+                  </div>
+                  <h2 className="text-xl font-bold text-on-surface">{f.title}</h2>
+                </>
+              )}
+            </div>
+            <button
+              onClick={onClose}
+              className="w-8 h-8 rounded-full flex items-center justify-center hover:bg-surface-container-high text-on-surface-variant"
+            >
+              <Icon name="close" className="text-xl" />
+            </button>
+          </div>
+        </div>
+
+        {error && (
+          <div className="px-6 py-4 text-sm text-error">Failed to load details: {error.message}</div>
+        )}
+
+        {!loading && !error && detail && (
+          <div className="px-6 py-5 space-y-5">
+            {/* Device info */}
+            {device.hostname && (
+              <div className="flex items-center gap-4 text-sm">
+                <span className="inline-flex items-center gap-1.5 text-on-surface-variant">
+                  <Icon name="dns" className="text-[18px]" />
+                  {device.hostname}
+                </span>
+                <span className="inline-flex items-center gap-1.5 text-on-surface-variant">
+                  <Icon name="router" className="text-[18px]" />
+                  {device.platform} / {device.device_type}
+                </span>
+                <span className="inline-flex items-center gap-1.5 text-on-surface-variant">
+                  <Icon name="language" className="text-[18px]" />
+                  {device.management_ip}
+                </span>
+              </div>
+            )}
+
+            {/* Description */}
+            <div>
+              <h4 className="text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-2">
+                Analysis
+              </h4>
+              <p className="text-sm text-on-surface leading-relaxed">{f.description}</p>
+            </div>
+
+            {/* Affected entity */}
+            {f.affected_entity && (
+              <div>
+                <h4 className="text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-2">
+                  Affected Entity
+                </h4>
+                <p className="text-sm font-mono bg-surface-container-low rounded-lg px-3 py-2 text-on-surface">
+                  {f.affected_entity}
+                </p>
+              </div>
+            )}
+
+            {/* Evidence */}
+            {Object.keys(evidence).length > 0 && (
+              <div>
+                <h4 className="text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-2">
+                  Evidence
+                </h4>
+                <div className="bg-slate-900 rounded-lg p-4 overflow-x-auto">
+                  <pre className="font-mono text-[11px] text-slate-300 leading-relaxed whitespace-pre-wrap">
+                    {JSON.stringify(evidence, null, 2)}
+                  </pre>
+                </div>
+              </div>
+            )}
+
+            {/* Confidence */}
+            <div className="flex items-center gap-6">
+              <div>
+                <span className="text-xs font-bold uppercase tracking-widest text-on-surface-variant">
+                  Confidence
+                </span>
+                <p className="text-lg font-bold text-on-surface">
+                  {f.confidence != null ? `${Math.round(f.confidence * 100)}%` : '--'}
+                </p>
+              </div>
+              <div>
+                <span className="text-xs font-bold uppercase tracking-widest text-on-surface-variant">
+                  Remediation
+                </span>
+                <p className="text-lg font-bold text-on-surface">
+                  {f.requires_remediation ? 'Required' : 'Not required'}
+                </p>
+              </div>
+              <div>
+                <span className="text-xs font-bold uppercase tracking-widest text-on-surface-variant">
+                  Detected
+                </span>
+                <p className="text-sm font-semibold text-on-surface">
+                  {formatTimeAgo(f.created_at)}
+                </p>
+              </div>
+            </div>
+
+            {/* Recommendations */}
+            {recs.length > 0 && (
+              <div>
+                <h4 className="text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-3">
+                  Recommendations
+                </h4>
+                <div className="space-y-3">
+                  {recs.map((rec) => (
+                    <div key={rec.id} className="border border-outline/10 rounded-xl p-4 space-y-3">
+                      <p className="text-sm text-on-surface font-medium">{rec.action_description}</p>
+                      {rec.reasoning && (
+                        <p className="text-xs text-on-surface-variant">{rec.reasoning}</p>
+                      )}
+                      {rec.commands?.length > 0 && (
+                        <div className="bg-slate-900 rounded-lg p-3 overflow-x-auto">
+                          <pre className="font-mono text-[11px] text-slate-300 leading-relaxed">
+                            {rec.commands.join('\n')}
+                          </pre>
+                        </div>
+                      )}
+                      <div className="flex items-center gap-3">
+                        <StatusChip
+                          variant={
+                            rec.risk_level === 'high'
+                              ? 'error'
+                              : rec.risk_level === 'medium'
+                                ? 'warning'
+                                : 'success'
+                          }
+                        >
+                          {(rec.risk_level || 'unknown').toUpperCase()} RISK
+                        </StatusChip>
+                        {rec.approval && (
+                          <StatusChip
+                            variant={
+                              rec.approval.status === 'pending'
+                                ? 'warning'
+                                : rec.approval.status === 'approved'
+                                  ? 'success'
+                                  : 'neutral'
+                            }
+                          >
+                            {rec.approval.status.toUpperCase()}
+                          </StatusChip>
+                        )}
+                        {rec.approval?.status === 'pending' && (
+                          <a
+                            href="/approvals"
+                            className="text-xs font-bold text-primary hover:underline"
+                          >
+                            Go to Approvals &rarr;
+                          </a>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Action buttons */}
+            <div className="flex items-center gap-3 pt-3 border-t border-outline/10">
+              <button
+                onClick={handleDismiss}
+                disabled={acting !== null}
+                className="px-4 py-2 rounded-lg bg-surface-container-high text-on-surface-variant text-sm font-semibold hover:bg-surface-container-highest transition-colors disabled:opacity-50"
+              >
+                {acting === 'dismiss' ? 'Dismissing...' : 'Dismiss Finding'}
+              </button>
+              <button
+                onClick={handleEscalate}
+                disabled={acting !== null}
+                className="px-4 py-2 rounded-lg bg-error/10 text-error text-sm font-semibold hover:bg-error/20 transition-colors disabled:opacity-50"
+              >
+                {acting === 'escalate' ? 'Escalating...' : 'Escalate to Opus'}
+              </button>
+              {recs.some((r) => r.approval?.status === 'pending') && (
+                <a
+                  href="/approvals"
+                  className="ml-auto px-4 py-2 rounded-lg bg-gradient-to-br from-primary to-primary-container text-white text-sm font-semibold hover:shadow-lg hover:shadow-primary/20 transition-all"
+                >
+                  Review Approvals
+                </a>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Main Page ─── */
 export default function Insights() {
   const { data: findings, loading, error, refetch } = useApi(() => api.findings(), []);
   const [openMenu, setOpenMenu] = useState(null);
+  const [selectedFinding, setSelectedFinding] = useState(null);
+  const [acting, setActing] = useState({}); // { [findingId]: 'dismiss'|'escalate' }
+  const [severityFilter, setSeverityFilter] = useState(null); // null = all
 
   const items = findings || [];
+  const filteredItems = severityFilter
+    ? items.filter((f) => {
+        const s = f.severity?.toLowerCase();
+        if (severityFilter === 'high') return s === 'critical' || s === 'high';
+        return s === severityFilter;
+      })
+    : items;
   const remediationItems = items.filter((f) => f.requires_remediation);
   const criticalCount = items.filter(
     (f) => f.severity?.toLowerCase() === 'critical' || f.severity?.toLowerCase() === 'high',
@@ -139,8 +421,61 @@ export default function Insights() {
     api.pipelineRun({}).then(() => refetch());
   };
 
+  const openDetail = (findingId) => {
+    setOpenMenu(null);
+    setSelectedFinding(findingId);
+  };
+
+  const handleDismiss = useCallback(async (findingId) => {
+    setActing((prev) => ({ ...prev, [findingId]: 'dismiss' }));
+    setOpenMenu(null);
+    try {
+      await api.dismissFinding(findingId);
+      refetch();
+    } catch (e) {
+      alert(`Dismiss failed: ${e.message}`);
+    } finally {
+      setActing((prev) => {
+        const next = { ...prev };
+        delete next[findingId];
+        return next;
+      });
+    }
+  }, [refetch]);
+
+  const handleEscalate = useCallback(async (findingId) => {
+    setActing((prev) => ({ ...prev, [findingId]: 'escalate' }));
+    setOpenMenu(null);
+    try {
+      await api.escalateFinding(findingId);
+      // New findings will appear after pipeline completes — show feedback
+      setTimeout(() => refetch(), 3000);
+    } catch (e) {
+      alert(`Escalate failed: ${e.message}`);
+    } finally {
+      setActing((prev) => {
+        const next = { ...prev };
+        delete next[findingId];
+        return next;
+      });
+    }
+  }, [refetch]);
+
+  const handleApply = useCallback((findingId) => {
+    // Open detail modal which shows recommendation + approval link
+    setSelectedFinding(findingId);
+  }, []);
+
   return (
     <div className="min-h-screen bg-surface p-6 lg:p-10">
+      {/* Detail Modal */}
+      <FindingDetailModal
+        findingId={selectedFinding}
+        onClose={() => setSelectedFinding(null)}
+        onDismiss={() => refetch()}
+        onEscalate={() => setTimeout(() => refetch(), 3000)}
+      />
+
       {/* Page Header */}
       <header className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between mb-8">
         <div>
@@ -155,10 +490,13 @@ export default function Insights() {
           </p>
         </div>
         <div className="flex items-center gap-3 shrink-0">
-          <button className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg border border-outline/30 text-sm font-semibold text-on-surface-variant hover:bg-surface-container-high transition-colors">
+          <a
+            href="/executions"
+            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg border border-outline/30 text-sm font-semibold text-on-surface-variant hover:bg-surface-container-high transition-colors"
+          >
             <Icon name="history" className="text-lg" />
             Audit Log
-          </button>
+          </a>
           <button
             onClick={handleRescan}
             className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-gradient-to-br from-primary to-primary-container text-on-primary text-sm font-semibold shadow-lg shadow-primary/20 hover:shadow-primary/30 transition-all"
@@ -242,78 +580,116 @@ export default function Insights() {
 
             {/* Risk Detection Grid */}
             <div>
-              <h2 className="text-lg font-bold text-on-surface mb-4">Risk Detection</h2>
-              {items.length === 0 ? (
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-lg font-bold text-on-surface">Risk Detection</h2>
+                <div className="flex items-center gap-2">
+                  {[
+                    { key: null, label: 'All' },
+                    { key: 'high', label: 'High', variant: 'bg-error/10 text-error border-error/30' },
+                    { key: 'medium', label: 'Medium', variant: 'bg-tertiary/10 text-tertiary border-tertiary/30' },
+                    { key: 'low', label: 'Low', variant: 'bg-secondary/10 text-secondary border-secondary/30' },
+                  ].map((pill) => (
+                    <button
+                      key={pill.label}
+                      onClick={() => setSeverityFilter(pill.key)}
+                      className={`px-3 py-1 rounded-full text-xs font-bold border transition-colors ${
+                        severityFilter === pill.key
+                          ? pill.variant || 'bg-primary/10 text-primary border-primary/30'
+                          : 'bg-surface-container-low text-on-surface-variant border-outline/20 hover:bg-surface-container-high'
+                      }`}
+                    >
+                      {pill.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {filteredItems.length === 0 ? (
                 <div className="bg-surface-container-lowest rounded-xl border border-outline/10 p-10 text-center">
                   <Icon name="verified" className="text-4xl text-secondary mb-2" />
                   <p className="text-sm text-on-surface-variant">No findings detected. Infrastructure looks clean.</p>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {items.map((finding) => (
-                    <div
-                      key={finding.id}
-                      className="bg-surface-container-lowest rounded-xl border border-outline/10 p-5 hover:shadow-md transition-shadow relative group"
-                    >
-                      <div className="flex items-start gap-3 mb-3">
-                        <div
-                          className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 ${iconCircleBg(finding.severity)}`}
-                        >
-                          <Icon name={severityIcon(finding.severity)} className="text-lg" />
+                  {filteredItems.map((finding) => {
+                    const isActing = acting[finding.id];
+                    return (
+                      <div
+                        key={finding.id}
+                        className={`bg-surface-container-lowest rounded-xl border border-outline/10 p-5 hover:shadow-md transition-shadow relative group ${isActing ? 'opacity-60' : ''}`}
+                      >
+                        <div className="flex items-start gap-3 mb-3">
+                          <div
+                            className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 ${iconCircleBg(finding.severity)}`}
+                          >
+                            <Icon name={severityIcon(finding.severity)} className="text-lg" />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 mb-1">
+                              <StatusChip variant={severityChipVariant(finding.severity)} dot>
+                                {severityLabel(finding.severity)}
+                              </StatusChip>
+                              {finding.category && (
+                                <span className="text-[10px] font-medium text-on-surface-variant bg-surface-container-high px-2 py-0.5 rounded-full uppercase">
+                                  {finding.category}
+                                </span>
+                              )}
+                            </div>
+                            <h3 className="text-lg font-bold text-on-surface truncate">{finding.title}</h3>
+                          </div>
                         </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2 mb-1">
-                            <StatusChip variant={severityChipVariant(finding.severity)} dot>
-                              {severityLabel(finding.severity)}
-                            </StatusChip>
-                            {finding.category && (
-                              <span className="text-[10px] font-medium text-on-surface-variant bg-surface-container-high px-2 py-0.5 rounded-full uppercase">
-                                {finding.category}
-                              </span>
+                        <p className="text-sm text-on-surface-variant leading-relaxed mb-4 line-clamp-2">
+                          {finding.description}
+                        </p>
+                        <div className="flex items-center justify-between">
+                          <button
+                            onClick={() => openDetail(finding.id)}
+                            className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold transition-colors ${btnColor(finding.severity)}`}
+                          >
+                            <Icon name="open_in_new" className="text-sm" />
+                            Investigate
+                          </button>
+                          <div className="relative">
+                            <button
+                              onClick={() => setOpenMenu(openMenu === finding.id ? null : finding.id)}
+                              className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-surface-container-high text-on-surface-variant transition-colors"
+                            >
+                              <Icon name="more_vert" className="text-lg" />
+                            </button>
+                            {openMenu === finding.id && (
+                              <div className="absolute right-0 top-full mt-1 w-44 bg-surface-container-lowest rounded-lg shadow-lg border border-outline/10 py-1 z-10">
+                                <button
+                                  onClick={() => openDetail(finding.id)}
+                                  className="w-full text-left px-3 py-2 text-sm text-on-surface hover:bg-surface-container-high transition-colors flex items-center gap-2"
+                                >
+                                  <Icon name="visibility" className="text-[16px]" />
+                                  View Details
+                                </button>
+                                <button
+                                  onClick={() => handleDismiss(finding.id)}
+                                  className="w-full text-left px-3 py-2 text-sm text-on-surface hover:bg-surface-container-high transition-colors flex items-center gap-2"
+                                >
+                                  <Icon name="do_not_disturb_on" className="text-[16px]" />
+                                  Dismiss
+                                </button>
+                                <button
+                                  onClick={() => handleEscalate(finding.id)}
+                                  className="w-full text-left px-3 py-2 text-sm text-error hover:bg-error/5 transition-colors flex items-center gap-2"
+                                >
+                                  <Icon name="priority_high" className="text-[16px]" />
+                                  Escalate to Opus
+                                </button>
+                              </div>
                             )}
                           </div>
-                          <h3 className="text-lg font-bold text-on-surface truncate">{finding.title}</h3>
                         </div>
+                        {finding.affected_entity && (
+                          <p className="mt-3 text-[11px] text-on-surface-variant font-mono bg-surface-container-low rounded px-2 py-1 truncate">
+                            {finding.affected_entity}
+                          </p>
+                        )}
                       </div>
-                      <p className="text-sm text-on-surface-variant leading-relaxed mb-4 line-clamp-2">
-                        {finding.description}
-                      </p>
-                      <div className="flex items-center justify-between">
-                        <button
-                          className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold transition-colors ${btnColor(finding.severity)}`}
-                        >
-                          <Icon name="open_in_new" className="text-sm" />
-                          Investigate
-                        </button>
-                        <div className="relative">
-                          <button
-                            onClick={() => setOpenMenu(openMenu === finding.id ? null : finding.id)}
-                            className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-surface-container-high text-on-surface-variant transition-colors"
-                          >
-                            <Icon name="more_vert" className="text-lg" />
-                          </button>
-                          {openMenu === finding.id && (
-                            <div className="absolute right-0 top-full mt-1 w-40 bg-surface-container-lowest rounded-lg shadow-lg border border-outline/10 py-1 z-10">
-                              <button className="w-full text-left px-3 py-2 text-sm text-on-surface hover:bg-surface-container-high transition-colors">
-                                View Details
-                              </button>
-                              <button className="w-full text-left px-3 py-2 text-sm text-on-surface hover:bg-surface-container-high transition-colors">
-                                Dismiss
-                              </button>
-                              <button className="w-full text-left px-3 py-2 text-sm text-error hover:bg-error/5 transition-colors">
-                                Escalate
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                      {finding.affected_entity && (
-                        <p className="mt-3 text-[11px] text-on-surface-variant font-mono bg-surface-container-low rounded px-2 py-1 truncate">
-                          {finding.affected_entity}
-                        </p>
-                      )}
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -322,7 +698,7 @@ export default function Insights() {
           {/* ===== RIGHT SIDEBAR (col-span-4) ===== */}
           <div className="col-span-12 lg:col-span-4 flex flex-col gap-6">
             {/* Suggested Actions */}
-            <div className="glass-panel rounded-xl border border-outline/10 p-5">
+            <div className="bg-surface-container-lowest rounded-xl shadow-sm border border-outline/10 p-5">
               <div className="flex items-center gap-2 mb-4">
                 <Icon name="bolt" className="text-primary text-xl" fill />
                 <h2 className="text-base font-bold text-on-surface">Suggested Actions</h2>
@@ -353,7 +729,10 @@ export default function Insights() {
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-semibold text-on-surface truncate">{item.title}</p>
                         <p className="text-xs text-on-surface-variant line-clamp-2 mt-0.5">{item.description}</p>
-                        <button className="mt-1.5 text-xs font-bold text-primary hover:text-primary-container transition-colors">
+                        <button
+                          onClick={() => handleApply(item.id)}
+                          className="mt-1.5 text-xs font-bold text-primary hover:text-primary-container transition-colors"
+                        >
                           Apply &rarr;
                         </button>
                       </div>
@@ -400,7 +779,11 @@ export default function Insights() {
                         ? 'bg-tertiary'
                         : 'bg-secondary';
                   return (
-                    <div key={`tl-${finding.id}`} className="grid grid-cols-12 gap-3 items-start">
+                    <div
+                      key={`tl-${finding.id}`}
+                      className="grid grid-cols-12 gap-3 items-start cursor-pointer"
+                      onClick={() => openDetail(finding.id)}
+                    >
                       {/* Time */}
                       <div className="col-span-2 text-right">
                         <span className="text-xs font-mono text-on-surface-variant">
@@ -415,7 +798,7 @@ export default function Insights() {
                         <span className={`w-3 h-3 rounded-full ${dotClass} ring-4 ring-surface`} />
                       </div>
                       {/* Event Card */}
-                      <div className="col-span-9 bg-surface-container-low rounded-lg p-4 hover:bg-surface-container-high transition-colors cursor-pointer group">
+                      <div className="col-span-9 bg-surface-container-low rounded-lg p-4 hover:bg-surface-container-high transition-colors group">
                         <div className="flex items-center gap-2 mb-1">
                           <StatusChip variant={severityChipVariant(finding.severity)} dot>
                             {severityLabel(finding.severity)}

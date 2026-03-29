@@ -24,6 +24,17 @@ async def list_pending(db: AsyncSession) -> list[dict]:
     return [await _enrich_approval(db, a) for a in approvals]
 
 
+async def list_active(db: AsyncSession) -> list[dict]:
+    """List pending + approved (executing) approvals with full context."""
+    result = await db.execute(
+        select(Approval)
+        .where(Approval.status.in_(["pending", "approved"]))
+        .order_by(Approval.created_at.desc())
+    )
+    approvals = result.scalars().all()
+    return [await _enrich_approval(db, a) for a in approvals]
+
+
 async def list_history(db: AsyncSession, limit: int = 50) -> list[dict]:
     """List non-pending approvals (approved, denied, executed, failed, expired)."""
     result = await db.execute(
@@ -153,15 +164,26 @@ async def _enrich_approval(db: AsyncSession, approval: Approval) -> dict:
         "executed_at": approval.executed_at,
         "execution_result": approval.execution_result,
         "notes": approval.notes,
-        "jira_issue_key": approval.jira_issue_key,
-        "jira_issue_url": approval.jira_issue_url,
+        "jira_key": approval.jira_issue_key,
+        "jira_url": approval.jira_issue_url,
         "created_at": approval.created_at,
-        "finding_title": finding.title if finding else None,
-        "finding_severity": finding.severity if finding else None,
-        "device_hostname": device.hostname if device else None,
-        "action_description": rec.action_description if rec else None,
-        "commands": rec.commands if rec else None,
-        "rollback_commands": rec.rollback_commands if rec else None,
-        "risk_level": rec.risk_level if rec else None,
-        "reasoning": rec.reasoning if rec else None,
+        "finding": {
+            "id": finding.id,
+            "title": finding.title,
+            "severity": finding.severity,
+            "affected_entity": finding.affected_entity,
+        } if finding else None,
+        "recommendation": {
+            "id": rec.id,
+            "action": rec.action_description,
+            "action_description": rec.action_description,
+            "commands": rec.commands,
+            "rollback_commands": rec.rollback_commands,
+            "risk_level": rec.risk_level,
+            "reasoning": rec.reasoning,
+        } if rec else None,
+        "device": {
+            "id": device.id,
+            "hostname": device.hostname,
+        } if device else None,
     }

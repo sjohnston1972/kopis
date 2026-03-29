@@ -1,5 +1,6 @@
 """pyATS snapshot engine — connect to devices, learn features, store results."""
 
+import asyncio
 import time
 from datetime import datetime, timezone
 
@@ -69,6 +70,7 @@ async def take_snapshot(
 
     testbed = load_testbed(testbed_dict)
 
+    # Run blocking pyATS work per-device in a thread so the event loop stays free
     for device in devices:
         hostname = device.hostname
         tb_device = testbed.devices.get(hostname)
@@ -76,71 +78,24 @@ async def take_snapshot(
             log.error("testbed_device_missing", hostname=hostname)
             continue
 
-        start = time.time()
-        learned_data: dict = {}
-        learned_features: list[str] = []
+        result = await asyncio.to_thread(
+            _collect_device_snapshot, tb_device, hostname, features
+        )
 
-        try:
-            log.info("device_connecting", hostname=hostname)
-            tb_device.connect(
-                learn_hostname=True,
-                log_stdout=False,
-                connection_timeout=settings.pyats_connect_timeout,
-            )
-        except Exception as e:
-            log.error("device_connect_failed", hostname=hostname, error=str(e))
-            # Store a failed snapshot so we have a record
-            snapshot = Snapshot(
-                device_id=device.id,
-                snapshot_data={"error": f"Connection failed: {e}"},
-                features_learned=[],
-                triggered_by=triggered_by,
-                duration_seconds=time.time() - start,
-            )
-            db.add(snapshot)
-            snapshots.append(snapshot)
-            continue
-
-        for feature in features:
-            try:
-                log.info("device_learning", hostname=hostname, feature=feature)
-                output = tb_device.learn(feature)
-                # Genie learn() returns an object with an .info dict
-                if hasattr(output, "info"):
-                    learned_data[feature] = output.info
-                else:
-                    learned_data[feature] = str(output)
-                learned_features.append(feature)
-            except Exception as e:
-                log.warning(
-                    "feature_learn_failed",
-                    hostname=hostname,
-                    feature=feature,
-                    error=str(e),
-                )
-                learned_data[feature] = {"error": str(e)}
-
-        # Disconnect cleanly
-        try:
-            tb_device.disconnect()
-        except Exception:
-            pass
-
-        duration = time.time() - start
         snapshot = Snapshot(
             device_id=device.id,
-            snapshot_data=learned_data,
-            features_learned=learned_features,
+            snapshot_data=result["data"],
+            features_learned=result["features"],
             triggered_by=triggered_by,
-            duration_seconds=round(duration, 2),
+            duration_seconds=result["duration"],
         )
         db.add(snapshot)
         snapshots.append(snapshot)
         log.info(
             "snapshot_complete",
             hostname=hostname,
-            features=len(learned_features),
-            duration=round(duration, 2),
+            features=len(result["features"]),
+            duration=result["duration"],
         )
 
     await db.commit()
@@ -150,6 +105,63 @@ async def take_snapshot(
 
     log.info("snapshot_run_complete", total_devices=len(snapshots))
     return snapshots
+
+
+def _collect_device_snapshot(
+    tb_device, hostname: str, features: list[str]
+) -> dict:
+    """Blocking function that connects to a device and learns features.
+
+    Runs in a separate thread via asyncio.to_thread so it doesn't block
+    the event loop.
+    """
+    start = time.time()
+    learned_data: dict = {}
+    learned_features: list[str] = []
+
+    try:
+        log.info("device_connecting", hostname=hostname)
+        tb_device.connect(
+            learn_hostname=True,
+            log_stdout=False,
+            connection_timeout=settings.pyats_connect_timeout,
+        )
+    except Exception as e:
+        log.error("device_connect_failed", hostname=hostname, error=str(e))
+        return {
+            "data": {"error": f"Connection failed: {e}"},
+            "features": [],
+            "duration": round(time.time() - start, 2),
+        }
+
+    for feature in features:
+        try:
+            log.info("device_learning", hostname=hostname, feature=feature)
+            output = tb_device.learn(feature)
+            if hasattr(output, "info"):
+                learned_data[feature] = output.info
+            else:
+                learned_data[feature] = str(output)
+            learned_features.append(feature)
+        except Exception as e:
+            log.warning(
+                "feature_learn_failed",
+                hostname=hostname,
+                feature=feature,
+                error=str(e),
+            )
+            learned_data[feature] = {"error": str(e)}
+
+    try:
+        tb_device.disconnect()
+    except Exception:
+        pass
+
+    return {
+        "data": learned_data,
+        "features": learned_features,
+        "duration": round(time.time() - start, 2),
+    }
 
 
 async def get_snapshot(db: AsyncSession, snapshot_id: str) -> Snapshot | None:

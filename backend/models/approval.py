@@ -11,7 +11,29 @@ class ApprovalAction(BaseModel):
     notes: str | None = None
 
 
-class ApprovalRead(BaseModel):
+class FindingContext(BaseModel):
+    id: str
+    title: str
+    severity: str
+    affected_entity: str | None = None
+
+
+class RecommendationContext(BaseModel):
+    id: str
+    action: str | None = None
+    action_description: str | None = None
+    commands: list | None = None
+    rollback_commands: list | None = None
+    risk_level: str | None = None
+    reasoning: str | None = None
+
+
+class DeviceContext(BaseModel):
+    id: str
+    hostname: str
+
+
+class ApprovalDetail(BaseModel):
     id: str
     recommendation_id: str
     status: str
@@ -21,20 +43,9 @@ class ApprovalRead(BaseModel):
     executed_at: datetime | None = None
     execution_result: dict | None = None
     notes: str | None = None
-    jira_issue_key: str | None = None
-    jira_issue_url: str | None = None
+    jira_key: str | None = None
+    jira_url: str | None = None
     created_at: datetime
-
-    model_config = {"from_attributes": True}
-
-
-class ApprovalDetail(ApprovalRead):
-    """Extended approval with recommendation and finding context."""
-    finding_title: str | None = None
-    finding_severity: str | None = None
-    device_hostname: str | None = None
-    action_description: str | None = None
-    commands: list | None = None
-    rollback_commands: list | None = None
-    risk_level: str | None = None
-    reasoning: str | None = None
+    finding: FindingContext | None = None
+    recommendation: RecommendationContext | None = None
+    device: DeviceContext | None = None

@@ -4,7 +4,7 @@ import structlog
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.tables import Device, Snapshot
+from db.tables import Device, Setting, Snapshot
 
 log = structlog.get_logger()
 
@@ -25,9 +25,11 @@ async def build_topology(db: AsyncSession) -> dict:
     if not devices:
         return {"nodes": [], "edges": []}
 
-    # Fetch latest snapshot per device using a subquery
+    # Fetch latest *successful* snapshot per device (has features_learned).
+    # A failed/empty snapshot from an interrupted run should not hide good data.
     latest_sq = (
         select(Snapshot.device_id, func.max(Snapshot.created_at).label("max_ts"))
+        .where(func.array_length(Snapshot.features_learned, 1) > 0)
         .group_by(Snapshot.device_id)
         .subquery()
     )
@@ -141,17 +143,31 @@ async def build_topology(db: AsyncSession) -> dict:
                     "label": subnet,
                 })
 
+    # Load unmonitored interface settings for all devices
+    unmonitored_keys = [f"unmonitored:{d.id}" for d in devices]
+    unmonitored_map: dict[str, set[str]] = {}
+    if unmonitored_keys:
+        result = await db.execute(
+            select(Setting).where(Setting.key.in_(unmonitored_keys))
+        )
+        for setting in result.scalars().all():
+            dev_id = setting.key.split(":", 1)[1]
+            unmonitored_map[dev_id] = set(setting.value.get("interfaces", []))
+
     # Build nodes
     nodes = []
     for device in devices:
         snap = snapshots.get(device.id)
         intf_up = 0
         intf_total = 0
+        um = unmonitored_map.get(device.id, set())
         if snap and isinstance(snap.snapshot_data, dict):
             interfaces = snap.snapshot_data.get("interface", {})
             if isinstance(interfaces, dict):
                 for _name, data in interfaces.items():
                     if isinstance(data, dict):
+                        if _name in um:
+                            continue
                         intf_total += 1
                         if data.get("oper_status") == "up":
                             intf_up += 1

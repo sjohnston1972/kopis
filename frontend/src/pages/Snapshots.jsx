@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { api } from '../api/client';
+import { useSnapshotStatus } from '../hooks/useSnapshotStatus';
 import Icon from '../components/Icon';
 import StatusChip from '../components/StatusChip';
 
@@ -22,7 +23,7 @@ function formatDuration(seconds) {
   return `${m}m ${s}s`;
 }
 
-function SnapshotRow({ snapshot, devices, isSelected, onSelect }) {
+function SnapshotRow({ snapshot, devices, snapCount, isSelected, onSelect }) {
   const device = devices.find((d) => d.id === snapshot.device_id);
   const hostname = device?.hostname || snapshot.device_id.slice(0, 8);
   const hasError = snapshot.features_learned?.length === 0;
@@ -30,7 +31,7 @@ function SnapshotRow({ snapshot, devices, isSelected, onSelect }) {
   return (
     <div
       onClick={() => onSelect(snapshot)}
-      className={`grid grid-cols-[2fr_1.2fr_1fr_1fr_1fr_32px] gap-3 px-5 py-3.5 cursor-pointer transition-colors ${
+      className={`grid grid-cols-[2fr_0.6fr_1.2fr_1fr_1fr_1fr_32px] gap-3 px-5 py-3.5 cursor-pointer transition-colors ${
         isSelected ? 'bg-primary/5' : 'hover:bg-blue-50/30'
       }`}
     >
@@ -50,6 +51,14 @@ function SnapshotRow({ snapshot, devices, isSelected, onSelect }) {
           </span>
           <span className="text-[10px] text-on-surface-variant">{device?.management_ip || '--'}</span>
         </div>
+      </div>
+
+      {/* Snap count */}
+      <div className="flex items-center">
+        <span className="inline-flex items-center gap-1 text-xs font-bold text-on-surface-variant bg-surface-container-high rounded-full px-2 py-0.5">
+          <Icon name="camera" className="text-[12px]" />
+          {snapCount}
+        </span>
       </div>
 
       {/* Time */}
@@ -136,6 +145,89 @@ function DiffEntry({ path, change }) {
   );
 }
 
+function featureSummary(feature, data) {
+  if (!data || typeof data !== 'object') return null;
+  const stats = [];
+
+  if (feature === 'interface') {
+    const entries = Object.entries(data);
+    const up = entries.filter(([, v]) => v?.oper_status === 'up').length;
+    stats.push({ label: 'Interfaces', value: entries.length });
+    stats.push({ label: 'Up', value: up });
+    stats.push({ label: 'Down', value: entries.length - up });
+  } else if (feature === 'bgp') {
+    let neighbors = 0, established = 0;
+    for (const inst of Object.values(data.instance || {})) {
+      for (const vrf of Object.values(inst?.vrf || {})) {
+        const n = Object.entries(vrf?.neighbor || {});
+        neighbors += n.length;
+        established += n.filter(([, v]) => v?.session_state === 'Established').length;
+      }
+    }
+    stats.push({ label: 'Neighbors', value: neighbors });
+    stats.push({ label: 'Established', value: established });
+    if (neighbors - established > 0) stats.push({ label: 'Down', value: neighbors - established });
+  } else if (feature === 'vlan') {
+    const vlans = Object.keys(data.vlans || {});
+    stats.push({ label: 'VLANs', value: vlans.length });
+  } else if (feature === 'ospf') {
+    let areas = 0, intfs = 0;
+    const walk = (obj) => {
+      if (!obj || typeof obj !== 'object') return;
+      if (obj.areas) { areas += Object.keys(obj.areas).length; }
+      if (obj.interfaces) { intfs += Object.keys(obj.interfaces).length; }
+      Object.values(obj).forEach((v) => { if (typeof v === 'object') walk(v); });
+    };
+    walk(data);
+    stats.push({ label: 'Areas', value: areas });
+    stats.push({ label: 'Interfaces', value: intfs });
+  } else if (feature === 'arp') {
+    const entries = data.interfaces ? Object.values(data.interfaces).reduce(
+      (sum, intf) => sum + Object.keys(intf?.ipv4?.neighbors || {}).length, 0
+    ) : 0;
+    const stats_data = data.statistics || {};
+    stats.push({ label: 'ARP Entries', value: entries || '--' });
+    if (stats_data.in_requests_pkts) stats.push({ label: 'Requests In', value: stats_data.in_requests_pkts });
+  } else if (feature === 'routing') {
+    let routes = 0;
+    for (const vrf of Object.values(data.vrf || {})) {
+      for (const af of Object.values(vrf?.address_family || {})) {
+        routes += Object.keys(af?.routes || {}).length;
+      }
+    }
+    stats.push({ label: 'Routes', value: routes });
+  } else if (feature === 'platform') {
+    if (data.chassis) stats.push({ label: 'Chassis', value: data.chassis });
+    if (data.os) stats.push({ label: 'OS', value: data.os });
+    if (data.version) stats.push({ label: 'Version', value: data.version });
+  } else if (feature === 'hsrp') {
+    let groups = 0;
+    const walk = (obj) => {
+      if (!obj || typeof obj !== 'object') return;
+      if (obj.group_number !== undefined) { groups++; return; }
+      Object.values(obj).forEach(walk);
+    };
+    walk(data);
+    stats.push({ label: 'HSRP Groups', value: groups });
+  } else if (feature === 'vrf') {
+    stats.push({ label: 'VRFs', value: Object.keys(data.vrfs || data).length });
+  }
+
+  return stats.length > 0 ? stats : null;
+}
+
+const FEATURE_ICONS = {
+  interface: 'settings_ethernet',
+  bgp: 'hub',
+  ospf: 'swap_calls',
+  vlan: 'layers',
+  arp: 'dns',
+  routing: 'alt_route',
+  platform: 'memory',
+  hsrp: 'sync',
+  vrf: 'account_tree',
+};
+
 function SnapshotDetail({ snapshot, devices, onClose }) {
   const [tab, setTab] = useState('DATA');
   const [detail, setDetail] = useState(null);
@@ -162,6 +254,20 @@ function SnapshotDetail({ snapshot, devices, onClose }) {
         .finally(() => setLoadingDiff(false));
     }
   }, [tab, snapshot.id]);
+
+  // Group diff changes by feature (first path segment)
+  const groupedDiff = useMemo(() => {
+    if (!diff?.changes) return {};
+    const groups = {};
+    for (const [path, change] of Object.entries(diff.changes)) {
+      const feature = path.split('.')[0];
+      if (!groups[feature]) groups[feature] = {};
+      // Strip the feature prefix for display
+      const subPath = path.split('.').slice(1).join('.');
+      groups[feature][subPath] = change;
+    }
+    return groups;
+  }, [diff]);
 
   const TABS = ['DATA', 'FEATURES', 'DIFF'];
 
@@ -251,21 +357,64 @@ function SnapshotDetail({ snapshot, devices, onClose }) {
         )}
 
         {tab === 'FEATURES' && (
-          <div className="space-y-2">
-            {(snapshot.features_learned || []).map((feat) => (
-              <div key={feat} className="flex items-center gap-2.5 bg-surface-container-lowest rounded-lg px-4 py-3">
-                <Icon name="check_circle" className="text-base text-secondary" />
-                <span className="text-sm font-bold text-on-surface">{feat}</span>
-              </div>
-            ))}
-            {(!snapshot.features_learned || snapshot.features_learned.length === 0) && (
-              <div className="flex flex-col items-center py-8 text-on-surface-variant">
-                <Icon name="warning" className="text-3xl mb-2 opacity-40" />
-                <p className="text-xs font-semibold">No features learned</p>
-                <p className="text-[10px] mt-1 opacity-60">This snapshot may have failed</p>
-              </div>
-            )}
-          </div>
+          loadingDetail ? (
+            <div className="flex items-center justify-center py-12">
+              <div className="w-5 h-5 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
+            </div>
+          ) : detail?.snapshot_data ? (
+            <div className="space-y-3">
+              {Object.entries(detail.snapshot_data).map(([feature, data]) => {
+                const isError = typeof data === 'object' && data?.error;
+                const isString = typeof data === 'string';
+                const stats = (!isError && !isString) ? featureSummary(feature, data) : null;
+                const size = JSON.stringify(data).length;
+                const icon = FEATURE_ICONS[feature] || 'data_object';
+
+                return (
+                  <div key={feature} className="bg-surface-container-lowest rounded-xl overflow-hidden">
+                    <div className="flex items-center gap-3 px-4 py-3">
+                      <div className={`w-9 h-9 rounded-lg flex items-center justify-center ${
+                        isError ? 'bg-error/10' : 'bg-primary/8'
+                      }`}>
+                        <Icon name={isError ? 'error_outline' : icon} className={`text-lg ${isError ? 'text-error' : 'text-primary'}`} />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-bold text-on-surface capitalize">{feature}</span>
+                          <span className="text-[10px] text-on-surface-variant">
+                            {isError ? 'Error' : isString ? 'No data' : `${(size / 1024).toFixed(1)} KB`}
+                          </span>
+                        </div>
+                      </div>
+                      <StatusChip variant={isError ? 'error' : isString ? 'neutral' : 'success'} dot>
+                        {isError ? 'FAILED' : isString ? 'EMPTY' : 'OK'}
+                      </StatusChip>
+                    </div>
+
+                    {stats && (
+                      <div className="px-4 pb-3 flex flex-wrap gap-x-5 gap-y-1.5 border-t border-outline/5 pt-2.5">
+                        {stats.map((s) => (
+                          <div key={s.label} className="flex items-center gap-1.5">
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-on-surface-variant">{s.label}</span>
+                            <span className="text-sm font-bold text-on-surface">{s.value}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {(snapshot.features_learned || []).map((feat) => (
+                <div key={feat} className="flex items-center gap-2.5 bg-surface-container-lowest rounded-lg px-4 py-3">
+                  <Icon name="check_circle" className="text-base text-secondary" />
+                  <span className="text-sm font-bold text-on-surface">{feat}</span>
+                </div>
+              ))}
+            </div>
+          )
         )}
 
         {tab === 'DIFF' && (
@@ -297,16 +446,40 @@ function SnapshotDetail({ snapshot, devices, onClose }) {
                     </div>
                   );
                 })()}
-                {Object.keys(diff.changes).length === 0 ? (
+                {Object.keys(groupedDiff).length === 0 ? (
                   <div className="flex flex-col items-center py-8 text-on-surface-variant">
                     <Icon name="check_circle" className="text-3xl mb-2 text-secondary opacity-60" />
                     <p className="text-xs font-semibold">No changes detected</p>
                   </div>
                 ) : (
-                  <div className="space-y-1.5 max-h-[calc(100vh-320px)] overflow-y-auto">
-                    {Object.entries(diff.changes).map(([path, change]) => (
-                      <DiffEntry key={path} path={path} change={change} />
-                    ))}
+                  <div className="space-y-4 max-h-[calc(100vh-320px)] overflow-y-auto">
+                    {Object.entries(groupedDiff).map(([feature, changes]) => {
+                      const changeList = Object.entries(changes);
+                      const addedCount = changeList.filter(([, c]) => c.status === 'added').length;
+                      const removedCount = changeList.filter(([, c]) => c.status === 'removed').length;
+                      const changedCount = changeList.filter(([, c]) => c.status === 'changed').length;
+                      const icon = FEATURE_ICONS[feature] || 'data_object';
+
+                      return (
+                        <details key={feature} className="group" open>
+                          <summary className="flex items-center gap-2.5 px-3 py-2.5 bg-surface-container-lowest rounded-lg cursor-pointer hover:bg-blue-50/30 transition-colors">
+                            <Icon name={icon} className="text-base text-primary" />
+                            <span className="text-sm font-bold text-on-surface capitalize flex-1">{feature}</span>
+                            <div className="flex items-center gap-2">
+                              {addedCount > 0 && <span className="text-[9px] font-bold text-emerald-400">+{addedCount}</span>}
+                              {removedCount > 0 && <span className="text-[9px] font-bold text-red-400">-{removedCount}</span>}
+                              {changedCount > 0 && <span className="text-[9px] font-bold text-amber-400">~{changedCount}</span>}
+                              <Icon name="expand_more" className="text-sm text-outline group-open:rotate-180 transition-transform" />
+                            </div>
+                          </summary>
+                          <div className="mt-1.5 space-y-1.5 pl-1">
+                            {changeList.map(([path, change]) => (
+                              <DiffEntry key={path} path={path} change={change} />
+                            ))}
+                          </div>
+                        </details>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -332,9 +505,10 @@ export default function Snapshots() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [selected, setSelected] = useState(null);
-  const [triggering, setTriggering] = useState(false);
   const [triggerDevice, setTriggerDevice] = useState('');
   const [filterDevice, setFilterDevice] = useState('');
+  const { status: snapStatus, triggerSnapshot, refresh: refreshSnapStatus } = useSnapshotStatus();
+  const wasRunning = useRef(false);
 
   const fetchData = useCallback(() => {
     setLoading(true);
@@ -350,16 +524,31 @@ export default function Snapshots() {
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
-  const handleTrigger = async () => {
-    setTriggering(true);
-    try {
-      await api.triggerSnapshot(triggerDevice || undefined);
-      setTriggerDevice('');
+  // Auto-refresh table when a snapshot run finishes
+  useEffect(() => {
+    if (snapStatus?.running) {
+      wasRunning.current = true;
+    } else if (wasRunning.current) {
+      wasRunning.current = false;
       fetchData();
+    }
+  }, [snapStatus?.running]);
+
+  // Snapshot count per device
+  const snapCounts = useMemo(() => {
+    const counts = {};
+    for (const s of snapshots) {
+      counts[s.device_id] = (counts[s.device_id] || 0) + 1;
+    }
+    return counts;
+  }, [snapshots]);
+
+  const handleTrigger = async () => {
+    try {
+      await triggerSnapshot(triggerDevice || undefined);
+      setTriggerDevice('');
     } catch (e) {
       setError(e);
-    } finally {
-      setTriggering(false);
     }
   };
 
@@ -389,7 +578,7 @@ export default function Snapshots() {
             >
               <option value="">All Devices</option>
               {devices.map((d) => (
-                <option key={d.id} value={d.id}>{d.hostname}</option>
+                <option key={d.id} value={d.id}>{d.hostname} ({snapCounts[d.id] || 0})</option>
               ))}
             </select>
 
@@ -407,15 +596,24 @@ export default function Snapshots() {
               </select>
               <button
                 onClick={handleTrigger}
-                disabled={triggering}
-                className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-primary text-white text-xs font-bold hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={snapStatus?.running}
+                className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold transition-colors ${
+                  snapStatus?.running
+                    ? 'bg-tertiary/10 text-tertiary cursor-not-allowed'
+                    : 'bg-primary text-white hover:bg-primary/90'
+                }`}
               >
-                {triggering ? (
-                  <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                {snapStatus?.running ? (
+                  <>
+                    <div className="w-3.5 h-3.5 border-2 border-tertiary/30 border-t-tertiary rounded-full animate-spin" />
+                    Snapshot Underway
+                  </>
                 ) : (
-                  <Icon name="play_arrow" className="text-base" />
+                  <>
+                    <Icon name="play_arrow" className="text-base" />
+                    Take Snapshot
+                  </>
                 )}
-                {triggering ? 'Running...' : 'Take Snapshot'}
               </button>
             </div>
           </div>
@@ -492,8 +690,8 @@ export default function Snapshots() {
         {!loading && !error && (
           <div className="bg-surface-container-lowest rounded-xl overflow-hidden">
             {/* Header */}
-            <div className="grid grid-cols-[2fr_1.2fr_1fr_1fr_1fr_32px] gap-3 px-5 py-3 bg-surface-container-low border-b border-outline/10">
-              {['Device', 'Taken', 'Features', 'Duration', 'Status'].map((h) => (
+            <div className="grid grid-cols-[2fr_0.6fr_1.2fr_1fr_1fr_1fr_32px] gap-3 px-5 py-3 bg-surface-container-low border-b border-outline/10">
+              {['Device', 'Snaps', 'Taken', 'Features', 'Duration', 'Status'].map((h) => (
                 <span key={h} className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">
                   {h}
                 </span>
@@ -514,6 +712,7 @@ export default function Snapshots() {
                     key={snap.id}
                     snapshot={snap}
                     devices={devices}
+                    snapCount={snapCounts[snap.device_id] || 1}
                     isSelected={selected?.id === snap.id}
                     onSelect={setSelected}
                   />

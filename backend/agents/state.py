@@ -50,6 +50,7 @@ class KopisState(TypedDict, total=False):
 
     # ── Control flow ─────────────────────────────────────────
     escalate_to_opus: bool
+    force_escalation: bool  # Set by manual escalation — always routes to Opus
     processing_stage: Literal[
         "normalise", "topology", "remediation", "escalation", "complete"
     ]

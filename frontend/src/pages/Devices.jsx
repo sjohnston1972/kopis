@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import Icon from '../components/Icon';
@@ -7,19 +7,6 @@ import StatusChip from '../components/StatusChip';
 const FILTERS = ['ALL', 'ACTIVE', 'ISSUES'];
 
 const TABS = ['CONFIG', 'INTERFACES', 'HEALTH'];
-
-const SAMPLE_CONFIG = `hostname R1-CORE
-!
-interface GigabitEthernet0/0
- ip address 10.0.0.1 255.255.255.0
- no shutdown
-!
-router ospf 1
- network 10.0.0.0 0.0.0.255 area 0
-!
-line vty 0 4
- transport input ssh
-!`;
 
 function getComplianceInfo(device) {
   const tags = device.tags || {};
@@ -33,11 +20,12 @@ function getComplianceInfo(device) {
 }
 
 function getDeviceStatus(device) {
-  const lastSeen = device.last_seen;
-  if (!lastSeen) return 'OFFLINE';
-  const diff = Date.now() - new Date(lastSeen).getTime();
-  // Consider offline if not seen in 30 minutes
-  return diff < 30 * 60 * 1000 ? 'ONLINE' : 'OFFLINE';
+  // Use last_refreshed (inventory sync) as the liveness signal.
+  // Devices are considered online if they were seen in the last refresh cycle (default 6h + buffer).
+  const ts = device.last_refreshed || device.last_seen;
+  if (!ts) return 'OFFLINE';
+  const diff = Date.now() - new Date(ts).getTime();
+  return diff < 24 * 60 * 60 * 1000 ? 'ONLINE' : 'OFFLINE';
 }
 
 function filterDevices(devices, filter) {
@@ -162,14 +150,187 @@ function DeviceTable({ devices, selectedDevice, onSelect }) {
   );
 }
 
+function extractPlatformMetrics(snapData) {
+  if (!snapData) return [];
+  const metrics = [];
+  const platform = snapData.platform || {};
+  if (platform.uptime) metrics.push({ label: 'Uptime', value: platform.uptime, icon: 'schedule' });
+  if (platform.chassis) metrics.push({ label: 'Chassis', value: platform.chassis, icon: 'developer_board' });
+  if (platform.os || platform.software_version)
+    metrics.push({ label: 'Software', value: platform.os || platform.software_version, icon: 'system_update' });
+
+  // Interface error totals
+  const intfs = snapData.interface || {};
+  let totalInErr = 0, totalOutErr = 0;
+  for (const d of Object.values(intfs)) {
+    if (!d || typeof d !== 'object') continue;
+    const c = d.counters || {};
+    totalInErr += c.in_errors || 0;
+    totalOutErr += c.out_errors || 0;
+  }
+  metrics.push({ label: 'In Errors', value: String(totalInErr), icon: 'error_outline' });
+  metrics.push({ label: 'Out Errors', value: String(totalOutErr), icon: 'warning' });
+
+  return metrics;
+}
+
+function extractInterfaces(snapData) {
+  if (!snapData?.interface) return [];
+  const intfs = snapData.interface;
+  return Object.entries(intfs)
+    .filter(([, d]) => d && typeof d === 'object')
+    .map(([name, d]) => {
+      const ipv4 = d.ipv4 || {};
+      const ips = typeof ipv4 === 'object' ? Object.keys(ipv4) : [];
+      const counters = d.counters || {};
+      return {
+        name,
+        oper_status: d.oper_status || 'unknown',
+        admin_status: d.enabled !== undefined ? (d.enabled ? 'up' : 'down') : (d.admin_state || 'unknown'),
+        ips,
+        in_errors: counters.in_errors || 0,
+        out_errors: counters.out_errors || 0,
+        in_discards: counters.in_discards || 0,
+        in_octets: counters.in_octets || 0,
+        out_octets: counters.out_octets || 0,
+        bandwidth: d.bandwidth || null,
+        mtu: d.mtu || null,
+        type: d.type || '',
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function extractHealthData(snapData) {
+  if (!snapData) return null;
+  const health = {};
+
+  // BGP neighbors
+  const bgp = snapData.bgp || {};
+  const bgpNeighbors = [];
+  for (const inst of Object.values(bgp.instance || {})) {
+    if (!inst || typeof inst !== 'object') continue;
+    for (const [vrfName, vrf] of Object.entries(inst.vrf || {})) {
+      if (!vrf || typeof vrf !== 'object') continue;
+      for (const [ip, ndata] of Object.entries(vrf.neighbor || {})) {
+        if (!ndata || typeof ndata !== 'object') continue;
+        bgpNeighbors.push({
+          ip,
+          vrf: vrfName,
+          remote_as: ndata.remote_as || '?',
+          state: ndata.session_state || 'Unknown',
+        });
+      }
+    }
+  }
+  health.bgp = bgpNeighbors;
+
+  // OSPF neighbors
+  const ospf = snapData.ospf || {};
+  const ospfAreas = [];
+  for (const [key, inst] of Object.entries(ospf)) {
+    if (!inst || typeof inst !== 'object') continue;
+    const areas = inst.areas || {};
+    for (const [areaId, area] of Object.entries(areas)) {
+      if (!area || typeof area !== 'object') continue;
+      const intfNames = Object.keys(area.interfaces || {});
+      if (intfNames.length) ospfAreas.push({ area: areaId, interfaces: intfNames });
+    }
+  }
+  health.ospf = ospfAreas;
+
+  // Interface summary
+  const intfs = snapData.interface || {};
+  let up = 0, down = 0, total = 0;
+  for (const d of Object.values(intfs)) {
+    if (!d || typeof d !== 'object') continue;
+    total++;
+    if (d.oper_status === 'up') up++;
+    else down++;
+  }
+  health.interfaces = { up, down, total };
+
+  // Routing
+  const routing = snapData.routing || {};
+  let routeCount = 0;
+  for (const vrf of Object.values(routing.vrf || {})) {
+    if (!vrf || typeof vrf !== 'object') continue;
+    for (const af of Object.values(vrf.address_family || {})) {
+      if (!af || typeof af !== 'object') continue;
+      routeCount += Object.keys(af.routes || {}).length;
+    }
+  }
+  health.routes = routeCount;
+
+  // VLANs
+  const vlan = snapData.vlan || {};
+  const vlans = vlan.vlans || {};
+  health.vlans = Object.keys(vlans).length;
+
+  // ARP
+  const arp = snapData.arp || {};
+  let arpCount = 0;
+  for (const iface of Object.values(arp.interfaces || {})) {
+    if (!iface || typeof iface !== 'object') continue;
+    arpCount += Object.keys(iface.ipv4?.neighbors || {}).length;
+  }
+  health.arp = arpCount;
+
+  return health;
+}
+
 function DetailPanel({ device, onClose }) {
   const [activeTab, setActiveTab] = useState('CONFIG');
   const [copied, setCopied] = useState(false);
+  const [snapshot, setSnapshot] = useState(null);
+  const [snapLoading, setSnapLoading] = useState(true);
+  const [unmonitored, setUnmonitored] = useState([]);
   const status = getDeviceStatus(device);
   const compliance = getComplianceInfo(device);
 
+  useEffect(() => {
+    let cancelled = false;
+    setSnapLoading(true);
+    setSnapshot(null);
+    setUnmonitored([]);
+
+    Promise.all([
+      api.deviceSnapshot(device.id).catch(() => null),
+      api.deviceUnmonitored(device.id).catch(() => ({ interfaces: [] })),
+    ]).then(([snap, um]) => {
+      if (cancelled) return;
+      setSnapshot(snap);
+      setUnmonitored(um?.interfaces || []);
+      setSnapLoading(false);
+    });
+
+    return () => { cancelled = true; };
+  }, [device.id]);
+
+  const snapData = snapshot?.snapshot_data || null;
+  const interfaces = extractInterfaces(snapData);
+  const platformMetrics = extractPlatformMetrics(snapData);
+  const healthData = extractHealthData(snapData);
+
+  const toggleUnmonitored = useCallback(
+    (intfName) => {
+      const next = unmonitored.includes(intfName)
+        ? unmonitored.filter((n) => n !== intfName)
+        : [...unmonitored, intfName];
+      setUnmonitored(next);
+      api.setDeviceUnmonitored(device.id, next).catch(() => {});
+    },
+    [device.id, unmonitored]
+  );
+
+  const configText = snapData
+    ? `Features learned: ${(snapshot.features_learned || []).join(', ')}\nSnapshot taken: ${snapshot.created_at}\n\n` +
+      (snapData.config?.running_config || 'No running config captured in snapshot.\nUse pyATS learn(\'config\') to capture.')
+    : null;
+
   const handleCopy = () => {
-    navigator.clipboard.writeText(SAMPLE_CONFIG).then(() => {
+    if (!configText) return;
+    navigator.clipboard.writeText(configText).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     });
@@ -222,13 +383,27 @@ function DetailPanel({ device, onClose }) {
 
       {/* Tab content */}
       <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
-        {activeTab === 'CONFIG' && (
+        {snapLoading && (
+          <div className="flex items-center justify-center py-12">
+            <div className="w-5 h-5 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
+          </div>
+        )}
+
+        {!snapLoading && !snapData && (
+          <div className="flex flex-col items-center justify-center py-12 text-on-surface-variant">
+            <Icon name="cloud_off" className="text-3xl mb-2 opacity-40" />
+            <p className="text-xs font-semibold">No snapshot data</p>
+            <p className="text-[10px] mt-1 opacity-60">Trigger a snapshot to collect data</p>
+          </div>
+        )}
+
+        {!snapLoading && snapData && activeTab === 'CONFIG' && (
           <>
-            {/* Running Config */}
+            {/* Running Config / Snapshot info */}
             <div>
               <div className="flex items-center justify-between mb-2">
                 <span className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">
-                  Running Config
+                  {snapData.config?.running_config ? 'Running Config' : 'Snapshot Info'}
                 </span>
                 <button
                   onClick={handleCopy}
@@ -239,33 +414,32 @@ function DetailPanel({ device, onClose }) {
                 </button>
               </div>
               <pre className="bg-slate-900 rounded-lg p-3.5 font-mono text-[11px] text-slate-300 overflow-x-auto leading-relaxed max-h-48 overflow-y-auto">
-                {SAMPLE_CONFIG}
+                {configText}
               </pre>
             </div>
 
-            {/* Quick Metrics */}
+            {/* Quick Metrics from snapshot */}
             <div>
               <span className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">
                 Quick Metrics
               </span>
               <div className="grid grid-cols-2 gap-2 mt-2">
-                {[
-                  { label: 'CPU Load', value: '12%', icon: 'memory' },
-                  { label: 'Uptime', value: '47d 8h', icon: 'schedule' },
-                  { label: 'Temp', value: '42 C', icon: 'thermostat' },
-                  { label: 'Errors', value: '0', icon: 'error_outline' },
-                ].map((m) => (
-                  <div
-                    key={m.label}
-                    className="flex items-center gap-2.5 bg-surface-container-lowest rounded-lg px-3 py-2.5"
-                  >
-                    <Icon name={m.icon} className="text-base text-on-surface-variant" />
-                    <div>
-                      <div className="text-xs font-bold text-on-surface">{m.value}</div>
-                      <div className="text-[10px] text-on-surface-variant">{m.label}</div>
+                {platformMetrics.length > 0 ? (
+                  platformMetrics.map((m) => (
+                    <div
+                      key={m.label}
+                      className="flex items-center gap-2.5 bg-surface-container-lowest rounded-lg px-3 py-2.5"
+                    >
+                      <Icon name={m.icon} className="text-base text-on-surface-variant" />
+                      <div>
+                        <div className="text-xs font-bold text-on-surface truncate max-w-[120px]">{m.value}</div>
+                        <div className="text-[10px] text-on-surface-variant">{m.label}</div>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  ))
+                ) : (
+                  <div className="col-span-2 text-[10px] text-on-surface-variant">No platform data in snapshot</div>
+                )}
               </div>
             </div>
 
@@ -275,39 +449,175 @@ function DetailPanel({ device, onClose }) {
               <div>
                 <div className="text-xs font-bold text-on-surface">{compliance.label}</div>
                 <div className="text-[10px] text-on-surface-variant">
-                  Last audit {device.last_refreshed ? new Date(device.last_refreshed).toLocaleDateString() : 'N/A'}
+                  Snapshot: {new Date(snapshot.created_at).toLocaleString()}
                 </div>
               </div>
             </div>
           </>
         )}
 
-        {activeTab === 'INTERFACES' && (
+        {!snapLoading && snapData && activeTab === 'INTERFACES' && (
           <div className="space-y-2">
-            {['GigabitEthernet0/0', 'GigabitEthernet0/1', 'Loopback0'].map((intf, i) => (
-              <div key={intf} className="flex items-center justify-between bg-surface-container-lowest rounded-lg px-4 py-3">
-                <div className="flex items-center gap-2.5">
-                  <Icon name="lan" className="text-base text-on-surface-variant" />
-                  <div>
-                    <div className="text-xs font-bold text-on-surface">{intf}</div>
-                    <div className="text-[10px] text-on-surface-variant">
-                      {i < 2 ? '10.0.' + i + '.1/24' : '1.1.1.1/32'}
+            {interfaces.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-12 text-on-surface-variant">
+                <Icon name="lan" className="text-3xl mb-2 opacity-40" />
+                <p className="text-xs font-semibold">No interface data</p>
+              </div>
+            ) : (
+              interfaces.map((intf) => {
+                const isUnmonitored = unmonitored.includes(intf.name);
+                const isUp = intf.oper_status === 'up';
+                return (
+                  <div
+                    key={intf.name}
+                    className={`bg-surface-container-lowest rounded-lg px-4 py-3 ${isUnmonitored ? 'opacity-50' : ''}`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <Icon name="lan" className="text-base text-on-surface-variant shrink-0" />
+                        <div className="min-w-0">
+                          <div className="text-xs font-bold text-on-surface truncate">{intf.name}</div>
+                          <div className="text-[10px] text-on-surface-variant truncate">
+                            {intf.ips.length > 0 ? intf.ips.join(', ') : 'No IP'}
+                            {intf.mtu ? ` · MTU ${intf.mtu}` : ''}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <StatusChip
+                          variant={isUp ? 'success' : 'error'}
+                          dot
+                        >
+                          {isUp ? 'UP' : 'DOWN'}
+                        </StatusChip>
+                      </div>
+                    </div>
+                    {/* Error counters if non-zero */}
+                    {(intf.in_errors > 0 || intf.out_errors > 0 || intf.in_discards > 0) && (
+                      <div className="flex gap-3 mt-1.5 ml-[30px]">
+                        {intf.in_errors > 0 && (
+                          <span className="text-[10px] text-error font-bold">In Err: {intf.in_errors}</span>
+                        )}
+                        {intf.out_errors > 0 && (
+                          <span className="text-[10px] text-error font-bold">Out Err: {intf.out_errors}</span>
+                        )}
+                        {intf.in_discards > 0 && (
+                          <span className="text-[10px] text-tertiary font-bold">Discards: {intf.in_discards}</span>
+                        )}
+                      </div>
+                    )}
+                    {/* Unmonitored toggle */}
+                    <div className="flex items-center gap-1.5 mt-1.5 ml-[30px]">
+                      <button
+                        onClick={() => toggleUnmonitored(intf.name)}
+                        className={`text-[10px] font-bold transition-colors ${
+                          isUnmonitored
+                            ? 'text-primary hover:text-primary/80'
+                            : 'text-on-surface-variant hover:text-error'
+                        }`}
+                      >
+                        {isUnmonitored ? 'Enable monitoring' : 'Mark unmonitored'}
+                      </button>
+                      {isUnmonitored && (
+                        <span className="text-[10px] text-on-surface-variant italic">unmonitored</span>
+                      )}
                     </div>
                   </div>
-                </div>
-                <StatusChip variant={i < 2 ? 'success' : 'neutral'} dot>
-                  {i < 2 ? 'UP' : 'ADMIN'}
-                </StatusChip>
-              </div>
-            ))}
+                );
+              })
+            )}
           </div>
         )}
 
-        {activeTab === 'HEALTH' && (
-          <div className="flex flex-col items-center justify-center py-12 text-on-surface-variant">
-            <Icon name="monitoring" className="text-3xl mb-2 opacity-40" />
-            <p className="text-xs font-semibold">Health metrics unavailable</p>
-            <p className="text-[10px] mt-1 opacity-60">Trigger a snapshot to collect data</p>
+        {!snapLoading && snapData && activeTab === 'HEALTH' && healthData && (
+          <div className="space-y-4">
+            {/* Interface summary */}
+            <div>
+              <span className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">
+                Interfaces
+              </span>
+              <div className="flex items-center gap-3 mt-2 bg-surface-container-lowest rounded-lg px-4 py-3">
+                <div className="flex-1">
+                  <div className="flex items-center gap-2 text-sm font-bold text-on-surface">
+                    <span className="text-secondary">{healthData.interfaces.up} up</span>
+                    <span className="text-on-surface-variant">/</span>
+                    <span className="text-error">{healthData.interfaces.down} down</span>
+                    <span className="text-on-surface-variant">/</span>
+                    <span>{healthData.interfaces.total} total</span>
+                  </div>
+                  <div className="w-full h-1.5 bg-outline/10 rounded-full mt-2 overflow-hidden">
+                    <div
+                      className="h-full bg-secondary rounded-full"
+                      style={{
+                        width: `${healthData.interfaces.total ? (healthData.interfaces.up / healthData.interfaces.total) * 100 : 0}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* BGP Neighbors */}
+            {healthData.bgp.length > 0 && (
+              <div>
+                <span className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">
+                  BGP Neighbors
+                </span>
+                <div className="space-y-1.5 mt-2">
+                  {healthData.bgp.map((n) => (
+                    <div key={n.ip} className="flex items-center justify-between bg-surface-container-lowest rounded-lg px-4 py-2.5">
+                      <div>
+                        <div className="text-xs font-bold text-on-surface font-mono">{n.ip}</div>
+                        <div className="text-[10px] text-on-surface-variant">AS{n.remote_as} · {n.vrf}</div>
+                      </div>
+                      <StatusChip
+                        variant={n.state.toLowerCase() === 'established' ? 'success' : 'error'}
+                        dot
+                      >
+                        {n.state}
+                      </StatusChip>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* OSPF Areas */}
+            {healthData.ospf.length > 0 && (
+              <div>
+                <span className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">
+                  OSPF Areas
+                </span>
+                <div className="space-y-1.5 mt-2">
+                  {healthData.ospf.map((a) => (
+                    <div key={a.area} className="bg-surface-container-lowest rounded-lg px-4 py-2.5">
+                      <div className="text-xs font-bold text-on-surface">Area {a.area}</div>
+                      <div className="text-[10px] text-on-surface-variant">{a.interfaces.join(', ')}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Quick stats */}
+            <div>
+              <span className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">
+                Summary
+              </span>
+              <div className="grid grid-cols-3 gap-2 mt-2">
+                {[
+                  { label: 'Routes', value: healthData.routes, icon: 'alt_route' },
+                  { label: 'VLANs', value: healthData.vlans, icon: 'account_tree' },
+                  { label: 'ARP', value: healthData.arp, icon: 'hub' },
+                ].map((m) => (
+                  <div key={m.label} className="flex flex-col items-center bg-surface-container-lowest rounded-lg px-3 py-2.5">
+                    <Icon name={m.icon} className="text-lg text-on-surface-variant" />
+                    <div className="text-sm font-bold text-on-surface mt-1">{m.value}</div>
+                    <div className="text-[10px] text-on-surface-variant">{m.label}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
         )}
       </div>
@@ -315,12 +625,12 @@ function DetailPanel({ device, onClose }) {
       {/* Footer buttons */}
       <div className="px-5 py-4 border-t border-outline/10 flex gap-2">
         <button className="flex-1 flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-lg bg-secondary/10 text-secondary text-xs font-bold hover:bg-secondary/15 transition-colors">
-          <Icon name="restart_alt" className="text-base" />
-          REBOOT
+          <Icon name="camera" className="text-base" />
+          SNAPSHOT
         </button>
         <button className="flex-1 flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-lg bg-primary text-white text-xs font-bold hover:bg-primary/90 transition-colors">
-          <Icon name="edit" className="text-base" />
-          EDIT CONFIG
+          <Icon name="terminal" className="text-base" />
+          SSH
         </button>
       </div>
     </div>
