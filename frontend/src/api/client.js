@@ -36,8 +36,28 @@ export const api = {
     return request(`/snapshots${qs}`);
   },
   snapshotStatus: () => request('/snapshots/status'),
+  clearSnapshotStatus: () => request('/snapshots/status', { method: 'DELETE' }),
+
+  // Snapshot schedules
+  schedules: () => request('/schedules'),
+  schedule: (id) => request(`/schedules/${id}`),
+  createSchedule: (body) =>
+    request('/schedules', { method: 'POST', body: JSON.stringify(body) }),
+  updateSchedule: (id, body) =>
+    request(`/schedules/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  deleteSchedule: (id) =>
+    request(`/schedules/${id}`, { method: 'DELETE' }),
+  runScheduleNow: (id) =>
+    request(`/schedules/${id}/run`, { method: 'POST' }),
   snapshot: (id) => request(`/snapshots/${id}`),
   snapshotDiff: (id) => request(`/snapshots/${id}/diff`),
+  deleteSnapshot: (id) => request(`/snapshots/${id}`, { method: 'DELETE' }),
+  deleteSnapshots: (ids) =>
+    request('/snapshots/bulk-delete', {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
+    }),
+  deleteAllSnapshots: () => request('/snapshots', { method: 'DELETE' }),
   triggerSnapshot: (deviceId) =>
     request('/snapshots', {
       method: 'POST',
@@ -64,6 +84,11 @@ export const api = {
   pipelineRun: (body) => request('/pipeline/run', { method: 'POST', body: JSON.stringify(body) }),
   pipelineStatus: () => request('/pipeline/status'),
   pipelineStats: () => request('/pipeline/stats'),
+  pipelineActivity: () => request('/pipeline/activity'),
+  pipelineActivityStream: () =>
+    fetch(`${API_BASE}/pipeline/activity/stream`, {
+      headers: { 'Accept': 'text/event-stream' },
+    }),
 
   // Execution
   execute: (approvalId) => request(`/execute/${approvalId}`, { method: 'POST' }),
@@ -78,6 +103,6 @@ export const api = {
 
   // Topology
   topology: () => request('/topology'),
-  topologyLayout: () => request('/topology/layout'),
-  saveTopologyLayout: (data) => request('/topology/layout', { method: 'PUT', body: JSON.stringify(data) }),
+  topologyLayout: (view = 'bgp') => request(`/topology/layout/${view}`),
+  saveTopologyLayout: (view, data) => request(`/topology/layout/${view}`, { method: 'PUT', body: JSON.stringify(data) }),
 };

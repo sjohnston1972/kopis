@@ -9,6 +9,14 @@ export default function Layout() {
   const { pathname } = useLocation();
   const mainRef = useRef(null);
   const [chatState, setChatState] = useState('closed'); // 'closed' | 'minimized' | 'open'
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return window.localStorage.getItem('kopis.sidebarCollapsed') === '1';
+  });
+
+  useEffect(() => {
+    window.localStorage.setItem('kopis.sidebarCollapsed', sidebarCollapsed ? '1' : '0');
+  }, [sidebarCollapsed]);
 
   // Force browser repaint after navigation
   useEffect(() => {
@@ -25,8 +33,13 @@ export default function Layout() {
     <>
       <TopNav />
       <div className="flex min-h-screen">
-        <Sidebar />
-        <main ref={mainRef} className="flex-1 ml-64 p-8 bg-surface">
+        <Sidebar collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed((c) => !c)} />
+        <main
+          ref={mainRef}
+          className={`flex-1 p-8 bg-surface transition-[margin] duration-200 ${
+            sidebarCollapsed ? 'ml-20' : 'ml-64'
+          }`}
+        >
           <Outlet key={pathname} />
         </main>
       </div>

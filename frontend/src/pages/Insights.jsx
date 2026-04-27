@@ -1,8 +1,10 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useApi } from '../hooks/useApi';
+import { usePipelineEvents } from '../hooks/usePipelineEvents';
 import { api } from '../api/client';
 import Icon from '../components/Icon';
 import StatusChip from '../components/StatusChip';
+import { useDialog } from '../components/Dialog';
 
 const severityColor = (severity) => {
   switch (severity?.toLowerCase()) {
@@ -114,6 +116,7 @@ function FindingDetailModal({ findingId, onClose, onDismiss, onEscalate }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [acting, setActing] = useState(null);
+  const dialog = useDialog();
 
   useEffect(() => {
     if (!findingId) { setDetail(null); return; }
@@ -134,7 +137,7 @@ function FindingDetailModal({ findingId, onClose, onDismiss, onEscalate }) {
       onDismiss(findingId);
       onClose();
     } catch (e) {
-      alert(`Dismiss failed: ${e.message}`);
+      await dialog.alert({ title: 'Dismiss failed', message: e.message, variant: 'danger' });
     } finally {
       setActing(null);
     }
@@ -147,7 +150,7 @@ function FindingDetailModal({ findingId, onClose, onDismiss, onEscalate }) {
       onEscalate(findingId);
       onClose();
     } catch (e) {
-      alert(`Escalate failed: ${e.message}`);
+      await dialog.alert({ title: 'Escalate failed', message: e.message, variant: 'danger' });
     } finally {
       setActing(null);
     }
@@ -382,10 +385,14 @@ function FindingDetailModal({ findingId, onClose, onDismiss, onEscalate }) {
 /* ─── Main Page ─── */
 export default function Insights() {
   const { data: findings, loading, error, refetch } = useApi(() => api.findings(), []);
+  usePipelineEvents(useCallback(() => refetch(), [refetch]));
   const [openMenu, setOpenMenu] = useState(null);
   const [selectedFinding, setSelectedFinding] = useState(null);
   const [acting, setActing] = useState({}); // { [findingId]: 'dismiss'|'escalate' }
   const [severityFilter, setSeverityFilter] = useState(null); // null = all
+  const [selectedIds, setSelectedIds] = useState(new Set()); // multi-select for bulk dismiss
+  const [bulkDismissing, setBulkDismissing] = useState(false);
+  const dialog = useDialog();
 
   const items = findings || [];
   const filteredItems = severityFilter
@@ -433,7 +440,7 @@ export default function Insights() {
       await api.dismissFinding(findingId);
       refetch();
     } catch (e) {
-      alert(`Dismiss failed: ${e.message}`);
+      await dialog.alert({ title: 'Dismiss failed', message: e.message, variant: 'danger' });
     } finally {
       setActing((prev) => {
         const next = { ...prev };
@@ -441,7 +448,7 @@ export default function Insights() {
         return next;
       });
     }
-  }, [refetch]);
+  }, [refetch, dialog]);
 
   const handleEscalate = useCallback(async (findingId) => {
     setActing((prev) => ({ ...prev, [findingId]: 'escalate' }));
@@ -451,7 +458,7 @@ export default function Insights() {
       // New findings will appear after pipeline completes — show feedback
       setTimeout(() => refetch(), 3000);
     } catch (e) {
-      alert(`Escalate failed: ${e.message}`);
+      await dialog.alert({ title: 'Escalate failed', message: e.message, variant: 'danger' });
     } finally {
       setActing((prev) => {
         const next = { ...prev };
@@ -459,12 +466,50 @@ export default function Insights() {
         return next;
       });
     }
-  }, [refetch]);
+  }, [refetch, dialog]);
 
   const handleApply = useCallback((findingId) => {
     // Open detail modal which shows recommendation + approval link
     setSelectedFinding(findingId);
   }, []);
+
+  const toggleSelect = useCallback((findingId) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(findingId)) next.delete(findingId);
+      else next.add(findingId);
+      return next;
+    });
+  }, []);
+
+  const handleDismissSelected = useCallback(async () => {
+    if (selectedIds.size === 0) return;
+    setBulkDismissing(true);
+    try {
+      await Promise.all([...selectedIds].map((id) => api.dismissFinding(id)));
+      setSelectedIds(new Set());
+      refetch();
+    } catch (e) {
+      await dialog.alert({ title: 'Bulk dismiss failed', message: e.message, variant: 'danger' });
+    } finally {
+      setBulkDismissing(false);
+    }
+  }, [selectedIds, refetch, dialog]);
+
+  const handleDismissAll = useCallback(async () => {
+    const ids = filteredItems.map((f) => f.id);
+    if (ids.length === 0) return;
+    setBulkDismissing(true);
+    try {
+      await Promise.all(ids.map((id) => api.dismissFinding(id)));
+      setSelectedIds(new Set());
+      refetch();
+    } catch (e) {
+      await dialog.alert({ title: 'Dismiss all failed', message: e.message, variant: 'danger' });
+    } finally {
+      setBulkDismissing(false);
+    }
+  }, [filteredItems, refetch, dialog]);
 
   return (
     <div className="min-h-screen bg-surface p-6 lg:p-10">
@@ -580,9 +625,17 @@ export default function Insights() {
 
             {/* Risk Detection Grid */}
             <div>
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-lg font-bold text-on-surface">Risk Detection</h2>
+              <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+                <div className="flex items-center gap-3">
+                  <h2 className="text-lg font-bold text-on-surface">Risk Detection</h2>
+                  {selectedIds.size > 0 && (
+                    <span className="text-xs font-bold text-primary bg-primary/10 px-2 py-0.5 rounded-full">
+                      {selectedIds.size} selected
+                    </span>
+                  )}
+                </div>
                 <div className="flex items-center gap-2">
+                  {/* Severity filters */}
                   {[
                     { key: null, label: 'All' },
                     { key: 'high', label: 'High', variant: 'bg-error/10 text-error border-error/30' },
@@ -601,6 +654,24 @@ export default function Insights() {
                       {pill.label}
                     </button>
                   ))}
+                  {/* Dismiss buttons */}
+                  <span className="w-px h-5 bg-outline/20" />
+                  {selectedIds.size > 0 && (
+                    <button
+                      onClick={handleDismissSelected}
+                      disabled={bulkDismissing}
+                      className="px-3 py-1 rounded-full text-xs font-bold border border-error/30 bg-error/10 text-error hover:bg-error/20 transition-colors disabled:opacity-50"
+                    >
+                      {bulkDismissing ? 'Dismissing...' : `Dismiss Selected (${selectedIds.size})`}
+                    </button>
+                  )}
+                  <button
+                    onClick={handleDismissAll}
+                    disabled={bulkDismissing || filteredItems.length === 0}
+                    className="px-3 py-1 rounded-full text-xs font-bold border border-outline/20 bg-surface-container-low text-on-surface-variant hover:bg-surface-container-high transition-colors disabled:opacity-50"
+                  >
+                    Dismiss All
+                  </button>
                 </div>
               </div>
               {filteredItems.length === 0 ? (
@@ -612,11 +683,23 @@ export default function Insights() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {filteredItems.map((finding) => {
                     const isActing = acting[finding.id];
+                    const isSelected = selectedIds.has(finding.id);
                     return (
                       <div
                         key={finding.id}
-                        className={`bg-surface-container-lowest rounded-xl border border-outline/10 p-5 hover:shadow-md transition-shadow relative group ${isActing ? 'opacity-60' : ''}`}
+                        onClick={() => toggleSelect(finding.id)}
+                        className={`rounded-xl border p-5 hover:shadow-md transition-all relative group cursor-pointer ${
+                          isSelected
+                            ? 'bg-primary/5 border-primary/30 ring-1 ring-primary/20'
+                            : 'bg-surface-container-lowest border-outline/10'
+                        } ${isActing ? 'opacity-60' : ''}`}
                       >
+                        {/* Selection indicator */}
+                        {isSelected && (
+                          <div className="absolute top-3 right-3 w-5 h-5 rounded-full bg-primary flex items-center justify-center">
+                            <Icon name="check" className="text-[14px] text-white" />
+                          </div>
+                        )}
                         <div className="flex items-start gap-3 mb-3">
                           <div
                             className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 ${iconCircleBg(finding.severity)}`}
@@ -633,6 +716,19 @@ export default function Insights() {
                                   {finding.category}
                                 </span>
                               )}
+                              {finding.agent_model && (
+                                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wide ${
+                                  finding.agent_model.toLowerCase().includes('opus')
+                                    ? 'bg-purple-500/15 text-purple-400 ring-1 ring-purple-500/30'
+                                    : finding.agent_model.toLowerCase().includes('sonnet')
+                                      ? 'bg-blue-500/15 text-blue-400 ring-1 ring-blue-500/30'
+                                      : finding.agent_model.toLowerCase().includes('haiku')
+                                        ? 'bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/30'
+                                        : 'bg-surface-container-high text-on-surface-variant'
+                                }`}>
+                                  {finding.agent_model}
+                                </span>
+                              )}
                             </div>
                             <h3 className="text-lg font-bold text-on-surface truncate">{finding.title}</h3>
                           </div>
@@ -642,7 +738,7 @@ export default function Insights() {
                         </p>
                         <div className="flex items-center justify-between">
                           <button
-                            onClick={() => openDetail(finding.id)}
+                            onClick={(e) => { e.stopPropagation(); openDetail(finding.id); }}
                             className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold transition-colors ${btnColor(finding.severity)}`}
                           >
                             <Icon name="open_in_new" className="text-sm" />
@@ -650,13 +746,13 @@ export default function Insights() {
                           </button>
                           <div className="relative">
                             <button
-                              onClick={() => setOpenMenu(openMenu === finding.id ? null : finding.id)}
+                              onClick={(e) => { e.stopPropagation(); setOpenMenu(openMenu === finding.id ? null : finding.id); }}
                               className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-surface-container-high text-on-surface-variant transition-colors"
                             >
                               <Icon name="more_vert" className="text-lg" />
                             </button>
                             {openMenu === finding.id && (
-                              <div className="absolute right-0 top-full mt-1 w-44 bg-surface-container-lowest rounded-lg shadow-lg border border-outline/10 py-1 z-10">
+                              <div onClick={(e) => e.stopPropagation()} className="absolute right-0 top-full mt-1 w-44 bg-surface-container-lowest rounded-lg shadow-lg border border-outline/10 py-1 z-10">
                                 <button
                                   onClick={() => openDetail(finding.id)}
                                   className="w-full text-left px-3 py-2 text-sm text-on-surface hover:bg-surface-container-high transition-colors flex items-center gap-2"
@@ -806,6 +902,19 @@ export default function Insights() {
                           {finding.affected_entity && (
                             <span className="text-[10px] font-mono text-on-surface-variant">
                               {finding.affected_entity}
+                            </span>
+                          )}
+                          {finding.agent_model && (
+                            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full uppercase tracking-wide ${
+                              finding.agent_model.toLowerCase().includes('opus')
+                                ? 'bg-purple-500/15 text-purple-400'
+                                : finding.agent_model.toLowerCase().includes('sonnet')
+                                  ? 'bg-blue-500/15 text-blue-400'
+                                  : finding.agent_model.toLowerCase().includes('haiku')
+                                    ? 'bg-emerald-500/15 text-emerald-400'
+                                    : 'bg-surface-container-high text-on-surface-variant'
+                            }`}>
+                              {finding.agent_model}
                             </span>
                           )}
                         </div>

@@ -13,6 +13,7 @@ import structlog
 from agents.state import KopisState
 from config import settings
 from integrations.anthropic import anthropic_client
+from services.activity import activity_bus
 
 log = structlog.get_logger()
 
@@ -23,6 +24,13 @@ async def escalation_node(state: KopisState) -> dict:
     """LangGraph node: deep re-analysis via Opus."""
     hostname = state.get("device_hostname", "unknown")
     log.info("escalation_start", hostname=hostname)
+    act_id = activity_bus.start(
+        pipeline_run=state.get("snapshot_id", ""),
+        node="escalation",
+        model=settings.opus_model,
+        device=hostname,
+        detail=f"Opus deep re-analysis — Haiku was not confident on {hostname}",
+    )
 
     prompt = (
         f"Device: {hostname} (platform: {state.get('device_platform', 'unknown')})\n\n"
@@ -44,7 +52,7 @@ async def escalation_node(state: KopisState) -> dict:
         )
     except Exception as e:
         log.error("escalation_failed", hostname=hostname, error=str(e))
-        # Fall back — keep original findings, skip remediation
+        activity_bus.fail(act_id, f"Opus escalation failed for {hostname}: {e}")
         return {
             "processing_stage": "complete",
             "errors": state.get("errors", []) + [f"Escalation failed: {e}"],
@@ -74,6 +82,7 @@ async def escalation_node(state: KopisState) -> dict:
     else:
         next_stage = "remediation"
 
+    activity_bus.complete(act_id, tokens=tokens, detail=f"Opus re-analysed {hostname}: {len(updated_findings)} findings, {len(recommendations)} direct recommendations")
     log.info(
         "escalation_complete",
         hostname=hostname,

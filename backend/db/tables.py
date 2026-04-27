@@ -153,6 +153,27 @@ class Setting(Base):
     )
 
 
+class SnapshotSchedule(Base):
+    __tablename__ = "snapshot_schedules"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    cron_expr: Mapped[str] = mapped_column(String(64), nullable=False)
+    device_ids: Mapped[list[str]] = mapped_column(ARRAY(String(36)), nullable=False, default=list)
+    features: Mapped[list[str]] = mapped_column(ARRAY(String(64)), nullable=False, default=list)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_result: Mapped[str | None] = mapped_column(String(32))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class AgentRun(Base):
     __tablename__ = "agent_runs"
 

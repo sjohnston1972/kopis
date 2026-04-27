@@ -15,6 +15,7 @@ class FindingDict(TypedDict, total=False):
     affected_entity: str  # e.g. "GigabitEthernet0/1"
     evidence: dict
     requires_remediation: bool
+    escalate_remediation: bool  # True = use Opus for remediation instead of Sonnet
 
 
 class RecommendationDict(TypedDict, total=False):
@@ -35,6 +36,7 @@ class KopisState(TypedDict, total=False):
     device_hostname: str
     device_platform: str  # e.g. "iosxe", "nxos", "iosv"
     raw_snapshot: dict  # Full pyATS learned data for this device
+    snapshot_diff: dict  # Diff against previous snapshot (empty if first snapshot)
 
     # ── Normaliser output ────────────────────────────────────
     normalised_data: dict

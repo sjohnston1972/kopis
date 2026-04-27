@@ -61,20 +61,43 @@ class AnthropicClient:
 
         # Try to parse as JSON (strip markdown fences if present)
         text = raw_text.strip()
-        if text.startswith("```"):
-            # Remove ```json ... ``` wrapper
-            lines = text.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            text = "\n".join(lines)
 
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                parsed["_tokens"] = tokens
-                parsed["_model"] = model
-            return parsed
-        except (json.JSONDecodeError, ValueError):
-            return {"text": raw_text, "_tokens": tokens, "_model": model}
+        # Extract JSON from markdown code fences: ```json ... ```
+        if "```" in text:
+            import re
+            # Match the first JSON block inside fences
+            m = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)
+            if m:
+                text = m.group(1).strip()
+            else:
+                # Fences opened but never closed (truncated response) — strip the opening fence
+                lines = text.split("\n")
+                if lines and lines[0].strip().startswith("```"):
+                    lines = lines[1:]
+                text = "\n".join(lines)
+
+        # Handle truncated JSON — try to close open braces/brackets
+        for attempt in range(3):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    parsed["_tokens"] = tokens
+                    parsed["_model"] = model
+                return parsed
+            except json.JSONDecodeError as e:
+                # If truncated, try adding closing braces
+                if "Expecting" in str(e) or "Unterminated" in str(e):
+                    # Count unclosed structures
+                    open_braces = text.count("{") - text.count("}")
+                    open_brackets = text.count("[") - text.count("]")
+                    if open_braces > 0 or open_brackets > 0:
+                        # Strip trailing comma or partial value
+                        text = text.rstrip().rstrip(",")
+                        text += "]" * open_brackets + "}" * open_braces
+                        continue
+                break
+
+        return {"text": raw_text, "_tokens": tokens, "_model": model, "_parse_error": True}
 
 
 anthropic_client = AnthropicClient()

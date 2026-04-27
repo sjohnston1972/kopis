@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,17 +36,73 @@ async def _write_status(db: AsyncSession, value: dict):
     await db.commit()
 
 
-async def _run_snapshot_background(device_id: str | None):
-    """Run snapshot in the background, updating status in the settings table."""
+async def _run_snapshot_background(
+    device_id: str | None,
+    *,
+    device_ids: list[str] | None = None,
+    features: list[str] | None = None,
+    triggered_by: str = "manual",
+):
+    """Run snapshot in the background, updating status in the settings table.
+
+    Either pass a single ``device_id`` (legacy/manual) or a list of
+    ``device_ids`` (scheduler).  ``features`` overrides the default per-device
+    feature list when provided.
+    """
     async with async_session() as db:
         started = datetime.now(timezone.utc)
         try:
+            # Count target devices for progress tracking
+            from db.tables import Device as DeviceModel
+            if device_ids:
+                dev_count_result = await db.execute(
+                    select(DeviceModel).where(DeviceModel.id.in_(device_ids))
+                )
+                total_devices = len(dev_count_result.scalars().all())
+            elif device_id:
+                dev_count_result = await db.execute(
+                    select(DeviceModel).where(DeviceModel.id == device_id)
+                )
+                total_devices = len(dev_count_result.scalars().all())
+            else:
+                dev_count_result = await db.execute(select(DeviceModel))
+                total_devices = len(dev_count_result.scalars().all())
+
             await _write_status(db, {
                 "running": True,
                 "started_at": started.isoformat(),
                 "device_id": device_id,
+                "triggered_by": triggered_by,
+                "devices_done": 0,
+                "devices_total": total_devices,
+                "current_device": None,
             })
-            results = await snapshot_engine.take_snapshot(db, device_id=device_id)
+
+            async def _on_progress(done: int, total: int, hostname: str):
+                await _write_status(db, {
+                    "running": True,
+                    "started_at": started.isoformat(),
+                    "device_id": device_id,
+                    "triggered_by": triggered_by,
+                    "devices_done": done,
+                    "devices_total": total,
+                    "current_device": hostname,
+                })
+
+            # Multi-device path runs each device sequentially through take_snapshot.
+            if device_ids:
+                results = []
+                for did in device_ids:
+                    part = await snapshot_engine.take_snapshot(
+                        db, device_id=did, features=features,
+                        triggered_by=triggered_by, on_progress=_on_progress,
+                    )
+                    results.extend(part)
+            else:
+                results = await snapshot_engine.take_snapshot(
+                    db, device_id=device_id, features=features,
+                    triggered_by=triggered_by, on_progress=_on_progress,
+                )
             finished = datetime.now(timezone.utc)
 
             # Build per-device breakdown
@@ -96,6 +153,8 @@ async def _run_snapshot_background(device_id: str | None):
                 log.info("pipeline_auto_trigger", count=len(successful_snapshots))
                 from agents.graph import run_pipeline
 
+                from services.snapshot_engine import get_snapshot_diff
+
                 for snap in successful_snapshots:
                     try:
                         hostname = dev_map.get(snap.device_id, "unknown")
@@ -106,6 +165,10 @@ async def _run_snapshot_background(device_id: str | None):
                         dev = dev_result2.scalar_one_or_none()
                         platform = dev.platform if dev else "unknown"
 
+                        # Compute diff for change-aware analysis
+                        diff_result = await get_snapshot_diff(db, snap.id)
+                        snapshot_diff = diff_result.get("changes", {})
+
                         await run_pipeline(
                             db=db,
                             snapshot_id=snap.id,
@@ -113,6 +176,7 @@ async def _run_snapshot_background(device_id: str | None):
                             device_hostname=hostname,
                             device_platform=platform,
                             raw_snapshot=snap.snapshot_data,
+                            snapshot_diff=snapshot_diff,
                         )
                         log.info("pipeline_auto_complete", hostname=hostname)
                     except Exception as pipe_err:
@@ -154,6 +218,19 @@ async def snapshot_status(db: AsyncSession = Depends(get_db)):
     return status
 
 
+@router.delete("/status")
+async def clear_snapshot_status(db: AsyncSession = Depends(get_db)):
+    """Clear the last-run snapshot status (does not affect actual snapshot rows).
+
+    Refuses if a snapshot is currently running so the live progress view isn't lost.
+    """
+    current = await _read_status(db)
+    if current.get("running"):
+        raise HTTPException(status_code=409, detail="Snapshot is currently running")
+    await _write_status(db, {"running": False})
+    return {"cleared": True}
+
+
 @router.post("", response_model=list[SnapshotRead])
 async def trigger_snapshot(
     body: SnapshotTrigger | None = None,
@@ -187,6 +264,105 @@ async def get_snapshot(snapshot_id: str, db: AsyncSession = Depends(get_db)):
     if not snapshot:
         raise HTTPException(status_code=404, detail="Snapshot not found")
     return snapshot
+
+
+@router.delete("/{snapshot_id}")
+async def delete_snapshot(snapshot_id: str, db: AsyncSession = Depends(get_db)):
+    """Delete a snapshot and all linked findings, recommendations, approvals, and agent runs."""
+    from db.tables import AgentRun, Approval, Finding, Recommendation, Snapshot
+
+    snapshot = await snapshot_engine.get_snapshot(db, snapshot_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    # Delete linked findings → recommendations → approvals
+    findings = await db.execute(select(Finding).where(Finding.snapshot_id == snapshot_id))
+    for f in findings.scalars().all():
+        recs = await db.execute(select(Recommendation).where(Recommendation.finding_id == f.id))
+        for r in recs.scalars().all():
+            apprs = await db.execute(select(Approval).where(Approval.recommendation_id == r.id))
+            for a in apprs.scalars().all():
+                await db.delete(a)
+            await db.delete(r)
+        await db.delete(f)
+
+    # Delete agent runs
+    runs = await db.execute(select(AgentRun).where(AgentRun.snapshot_id == snapshot_id))
+    for run in runs.scalars().all():
+        await db.delete(run)
+
+    await db.delete(snapshot)
+    await db.commit()
+
+    # Clean vector store
+    from db.vector import delete_by_snapshot
+    delete_by_snapshot(snapshot_id)
+
+    return {"deleted": snapshot_id}
+
+
+class BulkDeleteRequest(BaseModel):
+    ids: list[str]
+
+
+@router.post("/bulk-delete")
+async def bulk_delete_snapshots(body: BulkDeleteRequest, db: AsyncSession = Depends(get_db)):
+    """Delete a set of snapshots (and their linked findings/recommendations/approvals/agent runs)."""
+    from db.tables import AgentRun, Approval, Finding, Recommendation, Snapshot
+    from db.vector import delete_by_snapshot
+
+    if not body.ids:
+        return {"deleted": [], "missing": []}
+
+    result = await db.execute(select(Snapshot).where(Snapshot.id.in_(body.ids)))
+    found = {s.id: s for s in result.scalars().all()}
+    missing = [i for i in body.ids if i not in found]
+
+    for sid, snapshot in found.items():
+        findings = await db.execute(select(Finding).where(Finding.snapshot_id == sid))
+        for f in findings.scalars().all():
+            recs = await db.execute(select(Recommendation).where(Recommendation.finding_id == f.id))
+            for r in recs.scalars().all():
+                apprs = await db.execute(select(Approval).where(Approval.recommendation_id == r.id))
+                for a in apprs.scalars().all():
+                    await db.delete(a)
+                await db.delete(r)
+            await db.delete(f)
+        runs = await db.execute(select(AgentRun).where(AgentRun.snapshot_id == sid))
+        for run in runs.scalars().all():
+            await db.delete(run)
+        await db.delete(snapshot)
+
+    await db.commit()
+
+    for sid in found:
+        delete_by_snapshot(sid)
+
+    return {"deleted": list(found.keys()), "missing": missing}
+
+
+@router.delete("")
+async def delete_all_snapshots(db: AsyncSession = Depends(get_db)):
+    """Delete ALL snapshots and all linked data."""
+    from db.tables import AgentRun, Approval, Finding, Recommendation, Snapshot
+
+    # Clear all approvals → recommendations → findings → agent_runs → snapshots
+    await db.execute(select(Approval))  # warm cache
+    for table in [Approval, Recommendation, Finding, AgentRun, Snapshot]:
+        result = await db.execute(select(table))
+        for row in result.scalars().all():
+            await db.delete(row)
+
+    await db.commit()
+
+    # Wipe the entire vector collection
+    try:
+        from db.chromadb import chroma_client
+        chroma_client.delete_collection("historical_findings")
+    except Exception:
+        pass
+
+    return {"deleted": "all"}
 
 
 @router.get("/{snapshot_id}/diff", response_model=SnapshotDiff)

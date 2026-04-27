@@ -38,6 +38,10 @@ class JiraClient:
         approval_id: str,
         commands: list | None = None,
         risk_level: str = "medium",
+        reasoning: str | None = None,
+        rollback_commands: list | None = None,
+        analysis_model: str | None = None,
+        remediation_model: str | None = None,
     ) -> dict | None:
         """Create a Jira issue for a remediation recommendation.
 
@@ -57,18 +61,39 @@ class JiraClient:
         }
         priority = priority_map.get(severity, "Medium")
 
-        # Build description with ADF (Atlassian Document Format)
+        # Build description
         command_text = ""
         if commands:
             cmd_list = "\n".join(f"  {c}" for c in commands) if isinstance(commands[0], str) else str(commands)
             command_text = f"\n\n*Commands to execute:*\n{{code}}\n{cmd_list}\n{{code}}"
+
+        reasoning_text = ""
+        if reasoning:
+            reasoning_text = f"\n\n*AI Reasoning:*\n{reasoning}"
+
+        rollback_text = ""
+        if rollback_commands:
+            rb_list = "\n".join(f"  {c}" for c in rollback_commands) if isinstance(rollback_commands[0], str) else str(rollback_commands)
+            rollback_text = f"\n\n*Rollback Commands:*\n{{code}}\n{rb_list}\n{{code}}"
+
+        model_text = ""
+        models = []
+        if analysis_model:
+            models.append(f"Analysis: {analysis_model}")
+        if remediation_model:
+            models.append(f"Remediation: {remediation_model}")
+        if models:
+            model_text = f"\n*AI Models:* {', '.join(models)}"
 
         full_description = (
             f"{description}\n\n"
             f"*Device:* {device_hostname}\n"
             f"*Risk Level:* {risk_level}\n"
             f"*Kopis Approval ID:* {approval_id}"
+            f"{model_text}"
+            f"{reasoning_text}"
             f"{command_text}"
+            f"{rollback_text}"
         )
 
         payload = {

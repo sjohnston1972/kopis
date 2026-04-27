@@ -1,6 +1,9 @@
 """Pipeline execution and status endpoints."""
 
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agents.graph import run_pipeline
 from db.postgres import get_db
 from db.tables import AgentRun, Snapshot
+from services.activity import activity_bus
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 
@@ -45,6 +49,12 @@ async def run_pipeline_endpoint(
     if not device:
         raise HTTPException(status_code=404, detail="Device not found for snapshot")
 
+    # Compute diff against previous snapshot for change detection
+    from services.snapshot_engine import get_snapshot_diff
+
+    diff_result = await get_snapshot_diff(db, snapshot.id)
+    snapshot_diff = diff_result.get("changes", {})
+
     final_state = await run_pipeline(
         db=db,
         snapshot_id=snapshot.id,
@@ -52,6 +62,7 @@ async def run_pipeline_endpoint(
         device_hostname=device.hostname,
         device_platform=device.platform,
         raw_snapshot=snapshot.snapshot_data,
+        snapshot_diff=snapshot_diff,
     )
 
     return PipelineRunResult(
@@ -103,3 +114,40 @@ async def pipeline_stats(db: AsyncSession = Depends(get_db)):
         "total_tokens": row.total_tokens or 0,
         "avg_tokens_per_run": round(row.avg_tokens_per_run or 0, 1),
     }
+
+
+@router.get("/activity")
+async def pipeline_activity():
+    """Snapshot of current and recent pipeline activity."""
+    return activity_bus.get_snapshot()
+
+
+@router.get("/activity/stream")
+async def pipeline_activity_stream():
+    """SSE stream of real-time pipeline activity events."""
+    import json
+
+    async def event_generator():
+        q = activity_bus.subscribe()
+        try:
+            # Send initial state
+            snapshot = activity_bus.get_snapshot()
+            yield f"event: snapshot\ndata: {json.dumps(snapshot)}\n\n"
+
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=30.0)
+                    yield f"event: activity\ndata: {json.dumps(event.to_dict())}\n\n"
+                except asyncio.TimeoutError:
+                    # Keep-alive
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            activity_bus.unsubscribe(q)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

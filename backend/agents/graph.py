@@ -7,11 +7,13 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.nodes.escalation import escalation_node
+from agents.nodes.escalation_remediation import escalation_remediation_node
 from agents.nodes.normaliser import normaliser_node
 from agents.nodes.remediation import remediation_node
 from agents.nodes.topology import topology_node
 from agents.state import KopisState
 from db.tables import AgentRun, Approval, Finding, Recommendation
+from db.vector import delete_by_snapshot, embed_finding, find_similar
 
 log = structlog.get_logger()
 
@@ -22,6 +24,14 @@ def _route_after_topology(state: KopisState) -> str:
         return "escalation"
     stage = state.get("processing_stage", "complete")
     if stage == "remediation":
+        # Check if any findings want Opus-level remediation
+        findings = state.get("findings", [])
+        has_opus_remediation = any(
+            f.get("escalate_remediation") and f.get("requires_remediation")
+            for f in findings
+        )
+        if has_opus_remediation:
+            return "escalation_remediation"
         return "remediation"
     return "complete"
 
@@ -44,6 +54,7 @@ try:
     workflow.add_node("topology", topology_node)
     workflow.add_node("remediation", remediation_node)
     workflow.add_node("escalation", escalation_node)
+    workflow.add_node("escalation_remediation", escalation_remediation_node)
 
     # Entry point
     workflow.set_entry_point("normaliser")
@@ -53,10 +64,21 @@ try:
     workflow.add_conditional_edges(
         "topology",
         _route_after_topology,
-        {"escalation": "escalation", "remediation": "remediation", "complete": END},
+        {
+            "escalation": "escalation",
+            "escalation_remediation": "escalation_remediation",
+            "remediation": "remediation",
+            "complete": END,
+        },
     )
     workflow.add_conditional_edges(
         "escalation",
+        _route_after_escalation,
+        {"remediation": "remediation", "complete": END},
+    )
+    # Escalation remediation → Sonnet remediation (for non-escalated findings) or complete
+    workflow.add_conditional_edges(
+        "escalation_remediation",
         _route_after_escalation,
         {"remediation": "remediation", "complete": END},
     )
@@ -78,6 +100,7 @@ async def run_pipeline(
     device_platform: str,
     raw_snapshot: dict,
     force_escalation: bool = False,
+    snapshot_diff: dict | None = None,
 ) -> KopisState:
     """Execute the full LangGraph pipeline for a single device snapshot.
 
@@ -97,6 +120,7 @@ async def run_pipeline(
         "device_hostname": device_hostname,
         "device_platform": device_platform,
         "raw_snapshot": raw_snapshot,
+        "snapshot_diff": snapshot_diff or {},
         "normalised_data": {},
         "interface_summary": [],
         "routing_summary": [],
@@ -136,9 +160,38 @@ async def run_pipeline(
         await db.delete(old_finding)
     await db.flush()
 
+    # Clean vector store for this snapshot (handles re-runs)
+    delete_by_snapshot(snapshot_id)
+
     # Persist findings — remap AI-generated IDs to real UUIDs
+    # Deduplicate against historical findings in ChromaDB
     finding_id_map: dict[str, str] = {}  # old_id → new_id
+    deduped_count = 0
+    deduped_finding_ids: set[str] = set()  # real IDs of findings that were deduped
+    new_findings = []
     for f in final_state.get("findings", []):
+        # Check for near-duplicate in vector store (from previous snapshots)
+        similar = find_similar(
+            device_id=device_id,
+            title=f.get("title", ""),
+            description=f.get("description", ""),
+            affected_entity=f.get("affected_entity", ""),
+            exclude_snapshot_id=snapshot_id,
+        )
+        if similar:
+            deduped_count += 1
+            log.info(
+                "finding_deduped",
+                title=f.get("title", ""),
+                similar_to=similar[0]["finding_id"],
+                distance=similar[0]["distance"],
+            )
+            # Map the AI ID but mark as deduped — skip DB insert and recommendations
+            old_id = f.get("id", "")
+            finding_id_map[old_id] = similar[0]["finding_id"]
+            deduped_finding_ids.add(similar[0]["finding_id"])
+            continue
+
         old_id = f.get("id", "")
         finding_id = str(uuid.uuid4())
         finding_id_map[old_id] = finding_id
@@ -159,6 +212,22 @@ async def run_pipeline(
             tokens_used=None,
         )
         db.add(finding)
+        new_findings.append(f)
+
+        # Embed in vector store for future dedup
+        embed_finding(
+            finding_id=finding_id,
+            device_id=device_id,
+            title=f.get("title", ""),
+            description=f.get("description", ""),
+            category=f.get("category", "unknown"),
+            severity=f.get("severity", "info"),
+            affected_entity=f.get("affected_entity", ""),
+            snapshot_id=snapshot_id,
+        )
+
+    if deduped_count:
+        log.info("findings_deduped_total", count=deduped_count, kept=len(new_findings))
 
     # Persist recommendations, create approval records, and raise Jira tickets
     from integrations.jira import jira_client
@@ -170,10 +239,15 @@ async def run_pipeline(
     }
 
     for r in final_state.get("recommendations", []):
-        rec_id = str(uuid.uuid4())
         # Remap AI-generated finding_id to the real UUID we assigned
         raw_finding_id = r.get("finding_id", "")
         real_finding_id = finding_id_map.get(raw_finding_id, raw_finding_id)
+
+        # Skip recommendations for deduped findings (they already have approvals)
+        if real_finding_id in deduped_finding_ids:
+            continue
+
+        rec_id = str(uuid.uuid4())
         rec = Recommendation(
             id=rec_id,
             finding_id=real_finding_id,
@@ -200,6 +274,10 @@ async def run_pipeline(
             approval_id=approval.id,
             commands=r.get("commands"),
             risk_level=r.get("risk_level", "medium"),
+            reasoning=r.get("reasoning"),
+            rollback_commands=r.get("rollback_commands"),
+            analysis_model=linked_finding.get("agent_model"),
+            remediation_model=r.get("model_used"),
         )
         if jira_result:
             approval.jira_issue_key = jira_result["key"]

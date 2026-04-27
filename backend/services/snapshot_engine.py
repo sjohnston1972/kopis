@@ -11,13 +11,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
 from db.tables import Device, Snapshot
+from services.activity import activity_bus
 from services.testbed_generator import generate_testbed
 
 log = structlog.get_logger()
 
-# Features to learn from each device, in priority order.
-# 'all' is possible but slow on GNS3 — prefer a targeted list.
-DEFAULT_FEATURES = [
+# Features to learn per device type.
+# spanning_tree only makes sense on switches — routers don't participate.
+ROUTER_FEATURES = [
+    "interface",
+    "ospf",
+    "bgp",
+    "arp",
+    "routing",
+    "platform",
+    "hsrp",
+    "vrf",
+]
+
+SWITCH_FEATURES = [
     "interface",
     "ospf",
     "bgp",
@@ -30,12 +42,24 @@ DEFAULT_FEATURES = [
     "vrf",
 ]
 
+# Fallback for unknown device types — same as router (no spanning_tree).
+DEFAULT_FEATURES = ROUTER_FEATURES
+
+
+def _features_for_device(device) -> list[str]:
+    """Return the feature list appropriate for a device's type."""
+    dtype = (device.device_type or "").lower()
+    if dtype == "switch":
+        return SWITCH_FEATURES
+    return ROUTER_FEATURES
+
 
 async def take_snapshot(
     db: AsyncSession,
     device_id: str | None = None,
     features: list[str] | None = None,
     triggered_by: str = "manual",
+    on_progress=None,
 ) -> list[Snapshot]:
     """Take a pyATS snapshot of one or all devices.
 
@@ -55,7 +79,6 @@ async def take_snapshot(
         log.warning("snapshot_no_devices")
         return []
 
-    features = features or DEFAULT_FEATURES
     testbed_dict = generate_testbed(devices)
     snapshots: list[Snapshot] = []
 
@@ -70,17 +93,43 @@ async def take_snapshot(
 
     testbed = load_testbed(testbed_dict)
 
-    # Run blocking pyATS work per-device in a thread so the event loop stays free
+    # Build list of (device, tb_device) pairs, skipping missing testbed entries
+    device_pairs = []
     for device in devices:
-        hostname = device.hostname
-        tb_device = testbed.devices.get(hostname)
+        tb_device = testbed.devices.get(device.hostname)
         if not tb_device:
-            log.error("testbed_device_missing", hostname=hostname)
+            log.error("testbed_device_missing", hostname=device.hostname)
             continue
+        device_pairs.append((device, tb_device))
 
-        result = await asyncio.to_thread(
-            _collect_device_snapshot, tb_device, hostname, features
+    # Snapshot all devices in parallel (capped at 20 concurrent threads)
+    sem = asyncio.Semaphore(20)
+    done_count = 0
+    lock = asyncio.Lock()
+
+    async def _snap_one(device, tb_device):
+        nonlocal done_count
+        dev_features = features or _features_for_device(device)
+        act_id = activity_bus.start(
+            pipeline_run=f"snapshot:{triggered_by}",
+            node="snapshot",
+            model="pyats",
+            device=device.hostname,
+            detail=f"Connecting to {device.hostname} — learning {len(dev_features)} features",
         )
+        async with sem:
+            result = await asyncio.to_thread(
+                _collect_device_snapshot, tb_device, device.hostname, dev_features
+            )
+
+        has_error = "error" in result["data"] and not result["features"]
+        if has_error:
+            activity_bus.fail(act_id, f"Snapshot failed for {device.hostname}: {result['data'].get('error', 'unknown')}")
+        else:
+            activity_bus.complete(
+                act_id,
+                detail=f"Snapshot of {device.hostname} complete — {len(result['features'])} features in {result['duration']}s",
+            )
 
         snapshot = Snapshot(
             device_id=device.id,
@@ -89,14 +138,20 @@ async def take_snapshot(
             triggered_by=triggered_by,
             duration_seconds=result["duration"],
         )
-        db.add(snapshot)
-        snapshots.append(snapshot)
-        log.info(
-            "snapshot_complete",
-            hostname=hostname,
-            features=len(result["features"]),
-            duration=result["duration"],
-        )
+        async with lock:
+            db.add(snapshot)
+            snapshots.append(snapshot)
+            done_count += 1
+            log.info(
+                "snapshot_complete",
+                hostname=device.hostname,
+                features=len(result["features"]),
+                duration=result["duration"],
+            )
+            if on_progress:
+                await on_progress(done_count, len(device_pairs), device.hostname)
+
+    await asyncio.gather(*[_snap_one(d, tb) for d, tb in device_pairs])
 
     await db.commit()
     # Refresh to get server-generated fields
@@ -206,12 +261,54 @@ async def get_snapshot_diff(db: AsyncSession, snapshot_id: str) -> dict:
             "changes": {"note": "No previous snapshot to compare against"},
         }
 
-    changes = _diff_dicts(previous.snapshot_data, snapshot.snapshot_data)
+    raw_changes = _diff_dicts(previous.snapshot_data, snapshot.snapshot_data)
+    changes = _filter_noise(raw_changes)
     return {
         "snapshot_id": snapshot.id,
         "previous_snapshot_id": previous.id,
         "changes": changes,
     }
+
+
+# Diff path fragments that are operational noise — counters, timers, keepalives.
+# These change on every snapshot and never indicate a real problem.
+_NOISE_KEYWORDS = {
+    # Counters
+    "in_octets", "out_octets", "in_pkts", "out_pkts", "in_unicast_pkts",
+    "out_unicast_pkts", "in_broadcast_pkts", "out_broadcast_pkts",
+    "in_multicast_pkts", "out_multicast_pkts", "in_discards", "out_discards",
+    "in_unknown_protos", "last_clear", "rate", "in_rate", "out_rate",
+    "in_rate_pkts", "out_rate_pkts", "counters",
+    # Timers & keepalives
+    "keepalive", "dead_timer", "hello_timer", "last_input", "last_output",
+    "uptime", "up_time", "last_restart", "last_update", "last_read",
+    "last_write", "elapsed_time", "holdtime", "keepalive_interval",
+    "msg_rcvd", "msg_sent", "tbl_ver", "up_down",
+    # Timestamps and ages
+    "timestamp", "age", "last_change", "last_transition",
+    # OSPF/routing metric churn
+    "spf_count", "spf_last", "retransmit_count", "lsa_count",
+    "checksum_sum",
+}
+
+
+def _is_noise(path: str) -> bool:
+    """Return True if a diff path is operational noise that should be filtered."""
+    parts = path.lower().split(".")
+    leaf = parts[-1] if parts else ""
+    # Direct match on leaf key
+    if leaf in _NOISE_KEYWORDS:
+        return True
+    # Any segment matches a noise keyword
+    for part in parts:
+        if part in _NOISE_KEYWORDS:
+            return True
+    return False
+
+
+def _filter_noise(changes: dict) -> dict:
+    """Remove operational noise from a diff so only real state changes remain."""
+    return {k: v for k, v in changes.items() if not _is_noise(k)}
 
 
 def _diff_dicts(old: dict, new: dict, path: str = "") -> dict:

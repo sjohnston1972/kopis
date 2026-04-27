@@ -1,9 +1,11 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { useApi } from '../hooks/useApi';
+import { usePipelineEvents } from '../hooks/usePipelineEvents';
 import { api } from '../api/client';
 import { useSnapshotStatus } from '../hooks/useSnapshotStatus';
 import Icon from '../components/Icon';
 import StatusChip from '../components/StatusChip';
+import { useDialog } from '../components/Dialog';
 
 function formatTimeAgo(dateStr) {
   if (!dateStr) return '';
@@ -48,7 +50,7 @@ function MetricCard({ icon, label, value, sub, change, positive }) {
   );
 }
 
-function LastSnapshotCard({ status, onTrigger }) {
+function LastSnapshotCard({ status, onTrigger, onClear }) {
   const running = status?.running;
   const hasRun = status?.finished_at;
   const isOk = status?.result === 'ok';
@@ -63,11 +65,41 @@ function LastSnapshotCard({ status, onTrigger }) {
   };
 
   return (
-    <div className="bg-surface-container-lowest rounded-xl shadow-sm p-6 flex flex-col h-full">
+    <div className="bg-surface-container-lowest rounded-xl shadow-sm p-6 flex flex-col h-full relative">
+      {hasRun && !running && onClear && (
+        <button
+          type="button"
+          onClick={onClear}
+          title="Clear last run"
+          aria-label="Clear last run"
+          className="absolute top-4 right-4 p-1.5 rounded-lg text-on-surface-variant hover:text-error hover:bg-error/10 transition-colors"
+        >
+          <Icon name="backspace" className="text-base" />
+        </button>
+      )}
       <p className="text-[10px] font-bold uppercase tracking-widest text-on-surface-variant mb-1">
         Snapshots
       </p>
       <h3 className="text-lg font-bold text-on-surface mb-4">Last Run</h3>
+
+      {/* Running progress */}
+      {running && (
+        <div className="flex items-center gap-3 rounded-xl px-4 py-3 bg-primary/5 border border-primary/20 mb-3">
+          <div className="w-5 h-5 border-2 border-primary/30 border-t-primary rounded-full animate-spin shrink-0" />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-bold text-primary">
+              {status.devices_done != null && status.devices_total
+                ? `${status.devices_done}/${status.devices_total} snapshots complete`
+                : 'Starting...'}
+            </p>
+            {status.current_device && (
+              <p className="text-[10px] text-on-surface-variant truncate">
+                Snapshotting {status.current_device}...
+              </p>
+            )}
+          </div>
+        </div>
+      )}
 
       {hasRun ? (
         <div className="flex-1 flex flex-col gap-3">
@@ -111,11 +143,11 @@ function LastSnapshotCard({ status, onTrigger }) {
 
           {/* Per-device features */}
           {(status.per_device || []).length > 0 && (
-            <div className="space-y-1">
+            <div className="flex-1 flex flex-col min-h-0 gap-1">
               <span className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">
                 Features per device
               </span>
-              <div className="space-y-1 max-h-[180px] overflow-y-auto">
+              <div className="flex-1 min-h-0 space-y-1 overflow-y-auto pr-1">
                 {status.per_device.map((d) => (
                   <div key={d.hostname} className="flex items-center justify-between bg-surface-container-low rounded-lg px-3 py-1.5">
                     <span className="text-[11px] font-bold text-on-surface">{d.hostname}</span>
@@ -144,7 +176,6 @@ function LastSnapshotCard({ status, onTrigger }) {
           className="inline-flex items-center gap-1 text-primary text-xs font-semibold hover:underline"
         >
           View All
-          <Icon name="arrow_forward" className="text-[14px]" />
         </a>
         <button
           onClick={onTrigger}
@@ -158,7 +189,9 @@ function LastSnapshotCard({ status, onTrigger }) {
           {running ? (
             <>
               <div className="w-3.5 h-3.5 border-2 border-tertiary/30 border-t-tertiary rounded-full animate-spin" />
-              Snapshot Underway
+              {status.devices_done != null && status.devices_total
+                ? `${status.devices_done}/${status.devices_total}`
+                : 'Running...'}
             </>
           ) : (
             <>
@@ -211,11 +244,13 @@ function AlertRow({ finding }) {
 }
 
 export default function Dashboard() {
-  const { data: metrics, loading: metricsLoading } = useApi(api.dashboardMetrics);
-  const { data: findings, loading: findingsLoading } = useApi(() => api.findings({ limit: 8 }));
+  const { data: metrics, loading: metricsLoading, refetch: refetchMetrics } = useApi(api.dashboardMetrics);
+  const { data: findings, loading: findingsLoading, refetch: refetchFindings } = useApi(() => api.findings({ limit: 8 }));
   const { data: healthDeps, loading: healthLoading } = useApi(api.healthDeps);
-  const { data: approvals, loading: approvalsLoading } = useApi(api.approvals);
-  const { status: snapStatus, triggerSnapshot } = useSnapshotStatus();
+  const { data: approvals, loading: approvalsLoading, refetch: refetchApprovals } = useApi(api.approvals);
+  const { status: snapStatus, triggerSnapshot, refresh: refreshSnap } = useSnapshotStatus();
+  const dialog = useDialog();
+  usePipelineEvents(useCallback(() => { refetchMetrics(); refetchFindings(); refetchApprovals(); }, [refetchMetrics, refetchFindings, refetchApprovals]));
 
   const loading = metricsLoading || findingsLoading || healthLoading;
 
@@ -240,6 +275,8 @@ export default function Dashboard() {
   const bgpUp = m.bgp?.established || 0;
   const bgpDown = m.bgp?.down || 0;
   const bgpTotal = m.bgp?.total || 0;
+  const totalRoutes = m.routing?.routes || 0;
+  const totalArp = m.routing?.arp_entries || 0;
 
   // Global connectivity = weighted average of BGP + interface health
   const hasBgp = bgpTotal > 0;
@@ -275,30 +312,16 @@ export default function Dashboard() {
               Network Core / Global View
             </span>
           </div>
-          <h1 className="text-4xl font-bold text-on-surface">System Overview</h1>
+          <h1 className="text-4xl font-bold text-on-surface">Network Overview</h1>
         </div>
         <div className="flex items-center gap-3">
-          <button
-            onClick={() => triggerSnapshot()}
-            disabled={snapStatus?.running}
-            className={`inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-colors ${
-              snapStatus?.running
-                ? 'bg-tertiary/10 text-tertiary cursor-not-allowed'
-                : 'text-on-primary bg-primary hover:bg-primary/90'
-            }`}
+          <a
+            href="/snapshots"
+            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold text-on-surface-variant border border-outline/20 hover:bg-surface-container-high transition-colors"
           >
-            {snapStatus?.running ? (
-              <>
-                <div className="w-4 h-4 border-2 border-tertiary/30 border-t-tertiary rounded-full animate-spin" />
-                Snapshot Underway
-              </>
-            ) : (
-              <>
-                <Icon name="camera" className="text-[18px]" />
-                Take Snapshot
-              </>
-            )}
-          </button>
+            <Icon name="camera" className="text-[18px]" />
+            Snapshots
+          </a>
         </div>
       </div>
 
@@ -315,17 +338,17 @@ export default function Dashboard() {
         <div className="col-span-8 flex flex-col gap-6">
           {/* Hero Card */}
           <div className="bg-surface-container-lowest rounded-xl shadow-sm p-8 relative overflow-hidden">
-            <div className="absolute -right-20 -top-20 w-80 h-80 rounded-full bg-primary/5 pointer-events-none" />
+            <div className="absolute -right-32 -top-32 w-72 h-72 rounded-full bg-primary/5 pointer-events-none" />
 
             <p className="text-[10px] font-bold uppercase tracking-widest text-on-surface-variant mb-1 relative z-10">
               Network Health
             </p>
-            <h2 className="text-lg font-bold text-on-surface mb-6 relative z-10">
+            <h2 className="text-lg font-bold text-on-surface mb-5 relative z-10">
               Snapshot Anomalies
             </h2>
 
-            <div className="flex items-end gap-12 relative z-10">
-              <div>
+            <div className="relative z-10 flex flex-col gap-6">
+              <div className="flex items-baseline gap-4">
                 {connectivityPct !== null ? (
                   <span className={`text-7xl font-bold leading-none ${
                     connectivityPct >= 95 ? 'text-secondary' : connectivityPct >= 80 ? 'text-tertiary' : 'text-error'
@@ -337,52 +360,36 @@ export default function Dashboard() {
                     {loading ? '--' : 'N/A'}
                   </span>
                 )}
-                <p className="text-xs text-on-surface-variant mt-2">
-                  {bgpPct !== null ? `${bgpPct.toFixed(0)}% BGP` : 'No BGP data'}
-                  {' + '}
-                  {intfPct !== null ? `${intfPct.toFixed(0)}% Interfaces` : 'No interface data'}
-                </p>
+                {connectivityPct === 100 && !loading && (
+                  <span className="text-lg font-bold text-on-surface whitespace-nowrap">Anomaly Free</span>
+                )}
               </div>
 
-              <div className="flex items-center gap-8 pb-2">
-                <div className="flex items-center gap-2">
-                  <span className="w-3 h-3 rounded-full bg-secondary" />
-                  <div>
-                    <p className="text-xs text-on-surface-variant">BGP Up</p>
-                    <p className="text-lg font-bold text-on-surface">{bgpUp}</p>
-                  </div>
-                </div>
-                {bgpDown > 0 && (
-                  <div className="flex items-center gap-2">
-                    <span className="w-3 h-3 rounded-full bg-error" />
-                    <div>
-                      <p className="text-xs text-on-surface-variant">BGP Down</p>
-                      <p className="text-lg font-bold text-error">{bgpDown}</p>
+              <div className="flex flex-wrap items-center gap-x-8 gap-y-2">
+                {[
+                  { key: 'critical', label: 'Critical', color: 'bg-error',     text: 'text-error',     pulse: true },
+                  { key: 'high',     label: 'High',     color: 'bg-error/70',   text: 'text-error/80',  pulse: false },
+                  { key: 'medium',   label: 'Medium',   color: 'bg-tertiary',   text: 'text-tertiary',  pulse: false },
+                  { key: 'low',      label: 'Low',      color: 'bg-primary',    text: 'text-primary',   pulse: false },
+                  { key: 'info',     label: 'Info',     color: 'bg-outline',    text: 'text-on-surface-variant', pulse: false },
+                ].map((s) => {
+                  const count = findingCounts[s.key] || 0;
+                  return (
+                    <div key={s.key} className="flex items-center gap-2">
+                      <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${s.color} ${s.pulse && count > 0 ? 'animate-pulse' : ''} ${count === 0 ? 'opacity-30' : ''}`} />
+                      <p className={`text-[11px] uppercase tracking-wider font-bold ${count === 0 ? 'text-on-surface-variant/50' : 'text-on-surface-variant'}`}>
+                        {s.label}{' '}
+                        <span className={`text-sm font-bold tabular-nums inline-block min-w-[1.75rem] ${count === 0 ? 'text-on-surface-variant/40' : s.text}`}>{count}</span>
+                      </p>
                     </div>
-                  </div>
-                )}
-                <div className="flex items-center gap-2">
-                  <span className="w-3 h-3 rounded-full bg-primary" />
-                  <div>
-                    <p className="text-xs text-on-surface-variant">Interfaces</p>
-                    <p className="text-lg font-bold text-on-surface">{intfUp}/{intfTotal}</p>
-                  </div>
-                </div>
-                {criticalCount > 0 && (
-                  <div className="flex items-center gap-2">
-                    <span className="w-3 h-3 rounded-full bg-error animate-pulse" />
-                    <div>
-                      <p className="text-xs text-on-surface-variant">Critical</p>
-                      <p className="text-lg font-bold text-error">{criticalCount}</p>
-                    </div>
-                  </div>
-                )}
+                  );
+                })}
               </div>
             </div>
           </div>
 
           {/* Metric Cards */}
-          <div className="grid grid-cols-4 gap-4">
+          <div className="grid grid-cols-3 gap-4">
             <MetricCard
               icon="router"
               label="Devices"
@@ -404,6 +411,26 @@ export default function Dashboard() {
               sub={`of ${intfTotal} total (${intfTotal > 0 ? Math.round(intfUp / intfTotal * 100) : 0}%)`}
               change={intfDown > 0 ? `${intfDown} down` : undefined}
               positive={false}
+            />
+            <MetricCard
+              icon="alt_route"
+              label="Routes"
+              value={totalRoutes}
+              sub={
+                totalRoutes === 0
+                  ? 'No routes learned'
+                  : `of ${totalRoutes.toLocaleString()} total (${totalDevices > 0 ? Math.round(snappedDevices / totalDevices * 100) : 0}%)`
+              }
+            />
+            <MetricCard
+              icon="dns"
+              label="ARP Entries"
+              value={totalArp}
+              sub={
+                totalArp === 0
+                  ? 'No ARP data'
+                  : `of ${totalArp.toLocaleString()} total (${totalDevices > 0 ? Math.round(snappedDevices / totalDevices * 100) : 0}%)`
+              }
             />
             <MetricCard
               icon="verified_user"
@@ -431,12 +458,34 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Last Snapshot */}
-        <div className="col-span-4">
+        {/* Last Snapshot — wrapper is relative, card is absolute-filled so it
+            never contributes to grid row height (left column dictates it). */}
+        <div className="col-span-4 relative min-h-0">
+          <div className="absolute inset-0">
           <LastSnapshotCard
             status={snapStatus}
             onTrigger={() => triggerSnapshot()}
+            onClear={async () => {
+              const ok = await dialog.confirm({
+                title: 'Clear last run?',
+                message: 'Resets the card to its empty state. Snapshot data already taken is kept.',
+                confirmLabel: 'Clear',
+                variant: 'warning',
+              });
+              if (!ok) return;
+              try {
+                await api.clearSnapshotStatus();
+                refreshSnap();
+              } catch (e) {
+                await dialog.alert({
+                  title: 'Failed to clear last run',
+                  message: e.message || 'Unexpected error',
+                  variant: 'danger',
+                });
+              }
+            }}
           />
+          </div>
         </div>
 
         {/* Recent Alerts */}
@@ -492,7 +541,6 @@ export default function Dashboard() {
               className="inline-flex items-center gap-1 text-primary text-sm font-semibold mt-4 hover:underline"
             >
               View All Insights
-              <Icon name="arrow_forward" className="text-[16px]" />
             </a>
           )}
         </div>

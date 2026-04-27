@@ -172,6 +172,7 @@ async def _enrich_approval(db: AsyncSession, approval: Approval) -> dict:
             "title": finding.title,
             "severity": finding.severity,
             "affected_entity": finding.affected_entity,
+            "agent_model": finding.agent_model,
         } if finding else None,
         "recommendation": {
             "id": rec.id,
@@ -181,6 +182,7 @@ async def _enrich_approval(db: AsyncSession, approval: Approval) -> dict:
             "rollback_commands": rec.rollback_commands,
             "risk_level": rec.risk_level,
             "reasoning": rec.reasoning,
+            "agent_model": rec.agent_model,
         } if rec else None,
         "device": {
             "id": device.id,

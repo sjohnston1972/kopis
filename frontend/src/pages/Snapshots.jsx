@@ -3,6 +3,7 @@ import { api } from '../api/client';
 import { useSnapshotStatus } from '../hooks/useSnapshotStatus';
 import Icon from '../components/Icon';
 import StatusChip from '../components/StatusChip';
+import { useDialog } from '../components/Dialog';
 
 function timeAgo(dateStr) {
   const diff = Date.now() - new Date(dateStr).getTime();
@@ -23,7 +24,7 @@ function formatDuration(seconds) {
   return `${m}m ${s}s`;
 }
 
-function SnapshotRow({ snapshot, devices, snapCount, isSelected, onSelect }) {
+function SnapshotRow({ snapshot, devices, snapCount, isSelected, onSelect, isChecked, onToggleCheck }) {
   const device = devices.find((d) => d.id === snapshot.device_id);
   const hostname = device?.hostname || snapshot.device_id.slice(0, 8);
   const hasError = snapshot.features_learned?.length === 0;
@@ -31,10 +32,21 @@ function SnapshotRow({ snapshot, devices, snapCount, isSelected, onSelect }) {
   return (
     <div
       onClick={() => onSelect(snapshot)}
-      className={`grid grid-cols-[2fr_0.6fr_1.2fr_1fr_1fr_1fr_32px] gap-3 px-5 py-3.5 cursor-pointer transition-colors ${
+      className={`grid grid-cols-[32px_2fr_0.6fr_1.2fr_1fr_1fr_1fr_32px] gap-3 px-5 py-3.5 cursor-pointer transition-colors ${
         isSelected ? 'bg-primary/5' : 'hover:bg-blue-50/30'
       }`}
     >
+      {/* Checkbox */}
+      <div className="flex items-center" onClick={(e) => e.stopPropagation()}>
+        <input
+          type="checkbox"
+          checked={isChecked}
+          onChange={() => onToggleCheck(snapshot.id)}
+          className="w-4 h-4 accent-primary cursor-pointer"
+          aria-label={`Select snapshot ${snapshot.id.slice(0, 8)}`}
+        />
+      </div>
+
       {/* Device */}
       <div className="flex items-center gap-3 min-w-0">
         <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
@@ -228,12 +240,14 @@ const FEATURE_ICONS = {
   vrf: 'account_tree',
 };
 
-function SnapshotDetail({ snapshot, devices, onClose }) {
+function SnapshotDetail({ snapshot, devices, onClose, onSelectSnapshot, onDelete }) {
   const [tab, setTab] = useState('DATA');
   const [detail, setDetail] = useState(null);
   const [diff, setDiff] = useState(null);
+  const [deviceSnaps, setDeviceSnaps] = useState([]);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [loadingDiff, setLoadingDiff] = useState(false);
+  const [loadingSnaps, setLoadingSnaps] = useState(false);
 
   const device = devices.find((d) => d.id === snapshot.device_id);
 
@@ -255,6 +269,16 @@ function SnapshotDetail({ snapshot, devices, onClose }) {
     }
   }, [tab, snapshot.id]);
 
+  useEffect(() => {
+    if (tab === 'SNAPSHOTS') {
+      setLoadingSnaps(true);
+      api.snapshots({ device_id: snapshot.device_id, limit: 50 })
+        .then(setDeviceSnaps)
+        .catch(() => setDeviceSnaps([]))
+        .finally(() => setLoadingSnaps(false));
+    }
+  }, [tab, snapshot.device_id]);
+
   // Group diff changes by feature (first path segment)
   const groupedDiff = useMemo(() => {
     if (!diff?.changes) return {};
@@ -269,7 +293,7 @@ function SnapshotDetail({ snapshot, devices, onClose }) {
     return groups;
   }, [diff]);
 
-  const TABS = ['DATA', 'FEATURES', 'DIFF'];
+  const TABS = ['DATA', 'FEATURES', 'DIFF', 'SNAPSHOTS'];
 
   return (
     <div className="w-[480px] border-l border-outline/10 bg-surface-container-low shadow-[-4px_0_24px_rgba(0,0,0,0.04)] flex flex-col h-full overflow-hidden">
@@ -279,9 +303,18 @@ function SnapshotDetail({ snapshot, devices, onClose }) {
           <span className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">
             Snapshot Detail
           </span>
-          <button onClick={onClose} className="p-1 rounded-lg hover:bg-surface-container-high transition-colors">
-            <Icon name="close" className="text-lg text-on-surface-variant" />
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => onDelete && onDelete(snapshot.id)}
+              className="p-1 rounded-lg hover:bg-error/10 transition-colors"
+              title="Delete snapshot"
+            >
+              <Icon name="delete" className="text-lg text-error/60 hover:text-error" />
+            </button>
+            <button onClick={onClose} className="p-1 rounded-lg hover:bg-surface-container-high transition-colors">
+              <Icon name="close" className="text-lg text-on-surface-variant" />
+            </button>
+          </div>
         </div>
         <h2 className="text-xl font-extrabold text-on-surface">{device?.hostname || 'Unknown'}</h2>
         <div className="flex items-center gap-3 mt-2">
@@ -461,7 +494,7 @@ function SnapshotDetail({ snapshot, devices, onClose }) {
                       const icon = FEATURE_ICONS[feature] || 'data_object';
 
                       return (
-                        <details key={feature} className="group" open>
+                        <details key={feature} className="group">
                           <summary className="flex items-center gap-2.5 px-3 py-2.5 bg-surface-container-lowest rounded-lg cursor-pointer hover:bg-blue-50/30 transition-colors">
                             <Icon name={icon} className="text-base text-primary" />
                             <span className="text-sm font-bold text-on-surface capitalize flex-1">{feature}</span>
@@ -494,6 +527,75 @@ function SnapshotDetail({ snapshot, devices, onClose }) {
             <p className="text-sm text-on-surface-variant">Failed to load diff</p>
           )
         )}
+
+        {tab === 'SNAPSHOTS' && (
+          loadingSnaps ? (
+            <div className="flex items-center justify-center py-12">
+              <div className="w-5 h-5 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
+            </div>
+          ) : deviceSnaps.length > 0 ? (
+            <div className="space-y-2">
+              <p className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant mb-3">
+                {deviceSnaps.length} snapshot{deviceSnaps.length !== 1 ? 's' : ''} for {device?.hostname || 'this device'}
+              </p>
+              {deviceSnaps.map((s) => {
+                const isCurrent = s.id === snapshot.id;
+                const hasError = !s.features_learned?.length;
+                return (
+                  <button
+                    key={s.id}
+                    onClick={() => onSelectSnapshot && onSelectSnapshot(s)}
+                    className={`w-full text-left flex items-center gap-3 rounded-lg px-4 py-3 transition-colors ${
+                      isCurrent
+                        ? 'bg-primary/8 border border-primary/20'
+                        : 'bg-surface-container-lowest hover:bg-blue-50/30'
+                    }`}
+                  >
+                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
+                      hasError ? 'bg-error/10' : isCurrent ? 'bg-primary/10' : 'bg-secondary/10'
+                    }`}>
+                      <Icon
+                        name={hasError ? 'error_outline' : 'camera'}
+                        className={`text-base ${hasError ? 'text-error' : isCurrent ? 'text-primary' : 'text-secondary'}`}
+                      />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className={`text-xs font-bold ${isCurrent ? 'text-primary' : 'text-on-surface'}`}>
+                          {new Date(s.created_at).toLocaleString()}
+                        </span>
+                        {isCurrent && (
+                          <span className="text-[9px] font-bold text-primary bg-primary/10 px-1.5 py-0.5 rounded-full">
+                            CURRENT
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-3 mt-0.5">
+                        <span className="text-[10px] text-on-surface-variant">
+                          {s.features_learned?.length || 0} features
+                        </span>
+                        <span className="text-[10px] text-on-surface-variant">
+                          {formatDuration(s.duration_seconds)}
+                        </span>
+                        <span className="text-[10px] text-on-surface-variant capitalize">
+                          {s.triggered_by}
+                        </span>
+                      </div>
+                    </div>
+                    <StatusChip variant={hasError ? 'error' : 'success'} dot>
+                      {hasError ? 'FAIL' : 'OK'}
+                    </StatusChip>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="flex flex-col items-center py-8 text-on-surface-variant">
+              <Icon name="camera" className="text-3xl mb-2 opacity-40" />
+              <p className="text-xs font-semibold">No snapshots found</p>
+            </div>
+          )
+        )}
       </div>
     </div>
   );
@@ -505,10 +607,12 @@ export default function Snapshots() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [selected, setSelected] = useState(null);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [triggerDevice, setTriggerDevice] = useState('');
   const [filterDevice, setFilterDevice] = useState('');
   const { status: snapStatus, triggerSnapshot, refresh: refreshSnapStatus } = useSnapshotStatus();
   const wasRunning = useRef(false);
+  const dialog = useDialog();
 
   const fetchData = useCallback(() => {
     setLoading(true);
@@ -543,6 +647,8 @@ export default function Snapshots() {
     return counts;
   }, [snapshots]);
 
+  const [deleting, setDeleting] = useState(false);
+
   const handleTrigger = async () => {
     try {
       await triggerSnapshot(triggerDevice || undefined);
@@ -552,9 +658,91 @@ export default function Snapshots() {
     }
   };
 
+  const handleDeleteSnapshot = async (id) => {
+    setDeleting(true);
+    try {
+      await api.deleteSnapshot(id);
+      if (selected?.id === id) setSelected(null);
+      fetchData();
+    } catch (e) {
+      setError(e);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const handleDeleteAll = async () => {
+    const ok = await dialog.confirm({
+      title: 'Delete all snapshots?',
+      message: `${snapshots.length} snapshot${snapshots.length === 1 ? '' : 's'} and every linked finding, recommendation, and approval will be permanently removed. This cannot be undone.`,
+      confirmLabel: 'Delete all',
+      variant: 'danger',
+    });
+    if (!ok) return;
+    setDeleting(true);
+    try {
+      await api.deleteAllSnapshots();
+      setSelected(null);
+      setSelectedIds(new Set());
+      fetchData();
+    } catch (e) {
+      setError(e);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   const filtered = filterDevice
     ? snapshots.filter((s) => s.device_id === filterDevice)
     : snapshots;
+
+  const toggleCheck = useCallback((id) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const filteredIds = useMemo(() => filtered.map((s) => s.id), [filtered]);
+  const allFilteredChecked = filteredIds.length > 0 && filteredIds.every((id) => selectedIds.has(id));
+  const someFilteredChecked = filteredIds.some((id) => selectedIds.has(id));
+
+  const toggleSelectAll = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allFilteredChecked) {
+        filteredIds.forEach((id) => next.delete(id));
+      } else {
+        filteredIds.forEach((id) => next.add(id));
+      }
+      return next;
+    });
+  };
+
+  const handleDeleteSelected = async () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    const ok = await dialog.confirm({
+      title: `Delete ${ids.length} snapshot${ids.length === 1 ? '' : 's'}?`,
+      message: 'Linked findings, recommendations, and approvals will also be removed. This cannot be undone.',
+      confirmLabel: 'Delete',
+      variant: 'danger',
+    });
+    if (!ok) return;
+    setDeleting(true);
+    try {
+      await api.deleteSnapshots(ids);
+      if (selected && ids.includes(selected.id)) setSelected(null);
+      setSelectedIds(new Set());
+      fetchData();
+    } catch (e) {
+      setError(e);
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -606,7 +794,9 @@ export default function Snapshots() {
                 {snapStatus?.running ? (
                   <>
                     <div className="w-3.5 h-3.5 border-2 border-tertiary/30 border-t-tertiary rounded-full animate-spin" />
-                    Snapshot Underway
+                    {snapStatus.devices_done != null && snapStatus.devices_total
+                      ? `${snapStatus.devices_done}/${snapStatus.devices_total} complete`
+                      : 'Starting...'}
                   </>
                 ) : (
                   <>
@@ -616,8 +806,63 @@ export default function Snapshots() {
                 )}
               </button>
             </div>
+            {snapshots.length > 0 && (
+              <button
+                onClick={handleDeleteAll}
+                disabled={deleting}
+                className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold border border-error/30 text-error bg-error/5 hover:bg-error/10 transition-colors disabled:opacity-50"
+              >
+                <Icon name="delete_sweep" className="text-base" />
+                Delete All
+              </button>
+            )}
           </div>
         </div>
+
+        {/* Bulk-action bar */}
+        {selectedIds.size > 0 && (
+          <div className="flex items-center justify-between bg-primary/5 border border-primary/20 rounded-xl px-5 py-3 mb-4">
+            <div className="flex items-center gap-3">
+              <Icon name="check_box" className="text-primary" />
+              <span className="text-sm font-bold text-primary">
+                {selectedIds.size} snapshot{selectedIds.size === 1 ? '' : 's'} selected
+              </span>
+              <button
+                onClick={() => setSelectedIds(new Set())}
+                className="text-xs font-bold text-on-surface-variant hover:text-on-surface transition-colors"
+              >
+                Clear
+              </button>
+            </div>
+            <button
+              onClick={handleDeleteSelected}
+              disabled={deleting}
+              className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-error text-white hover:bg-error/90 transition-colors disabled:opacity-50"
+            >
+              <Icon name="delete" className="text-base" />
+              Delete Selected
+            </button>
+          </div>
+        )}
+
+        {/* Running progress banner */}
+        {snapStatus?.running && (
+          <div className="flex items-center gap-3 rounded-xl px-5 py-3.5 bg-primary/5 border border-primary/20 mb-5">
+            <div className="w-5 h-5 border-2 border-primary/30 border-t-primary rounded-full animate-spin shrink-0" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-bold text-primary">
+                {snapStatus.devices_done != null && snapStatus.devices_total
+                  ? `${snapStatus.devices_done}/${snapStatus.devices_total} snapshots complete`
+                  : 'Snapshot starting...'}
+              </p>
+              {snapStatus.current_device && (
+                <p className="text-[10px] text-on-surface-variant">
+                  Currently snapshotting {snapStatus.current_device}
+                </p>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Stats cards */}
         {!loading && snapshots.length > 0 && (
@@ -690,7 +935,18 @@ export default function Snapshots() {
         {!loading && !error && (
           <div className="bg-surface-container-lowest rounded-xl overflow-hidden">
             {/* Header */}
-            <div className="grid grid-cols-[2fr_0.6fr_1.2fr_1fr_1fr_1fr_32px] gap-3 px-5 py-3 bg-surface-container-low border-b border-outline/10">
+            <div className="grid grid-cols-[32px_2fr_0.6fr_1.2fr_1fr_1fr_1fr_32px] gap-3 px-5 py-3 bg-surface-container-low border-b border-outline/10">
+              <div className="flex items-center">
+                <input
+                  type="checkbox"
+                  checked={allFilteredChecked}
+                  ref={(el) => { if (el) el.indeterminate = !allFilteredChecked && someFilteredChecked; }}
+                  onChange={toggleSelectAll}
+                  disabled={filteredIds.length === 0}
+                  className="w-4 h-4 accent-primary cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                  aria-label="Select all visible snapshots"
+                />
+              </div>
               {['Device', 'Snaps', 'Taken', 'Features', 'Duration', 'Status'].map((h) => (
                 <span key={h} className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">
                   {h}
@@ -715,6 +971,8 @@ export default function Snapshots() {
                     snapCount={snapCounts[snap.device_id] || 1}
                     isSelected={selected?.id === snap.id}
                     onSelect={setSelected}
+                    isChecked={selectedIds.has(snap.id)}
+                    onToggleCheck={toggleCheck}
                   />
                 ))}
               </div>
@@ -729,6 +987,8 @@ export default function Snapshots() {
           snapshot={selected}
           devices={devices}
           onClose={() => setSelected(null)}
+          onSelectSnapshot={setSelected}
+          onDelete={handleDeleteSnapshot}
         />
       )}
     </div>

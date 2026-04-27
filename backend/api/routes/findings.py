@@ -123,6 +123,11 @@ async def dismiss_finding(finding_id: str, db: AsyncSession = Depends(get_db)):
 
     await db.delete(finding)
     await db.commit()
+
+    # Remove from vector store
+    from db.vector import delete_finding as vector_delete
+    vector_delete(finding_id)
+
     log.info("finding_dismissed", finding_id=finding_id, title=finding.title)
     return {"status": "dismissed", "id": finding_id}
 

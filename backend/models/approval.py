@@ -16,6 +16,7 @@ class FindingContext(BaseModel):
     title: str
     severity: str
     affected_entity: str | None = None
+    agent_model: str | None = None
 
 
 class RecommendationContext(BaseModel):
@@ -26,6 +27,7 @@ class RecommendationContext(BaseModel):
     rollback_commands: list | None = None
     risk_level: str | None = None
     reasoning: str | None = None
+    agent_model: str | None = None
 
 
 class DeviceContext(BaseModel):

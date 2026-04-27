@@ -1,5 +1,7 @@
 """Build topology graph from device inventory and snapshot data."""
 
+import ipaddress
+
 import structlog
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,24 +11,41 @@ from db.tables import Device, Setting, Snapshot
 log = structlog.get_logger()
 
 
+def _short_intf(name: str) -> str:
+    """Shorten interface names for display: GigabitEthernet0/1 → Gi0/1."""
+    replacements = [
+        ("GigabitEthernet", "Gi"),
+        ("FastEthernet", "Fa"),
+        ("TenGigabitEthernet", "Te"),
+        ("Loopback", "Lo"),
+        ("Vlan", "Vl"),
+        ("Port-channel", "Po"),
+        ("Ethernet", "Eth"),
+    ]
+    for full, short in replacements:
+        if name.startswith(full):
+            return short + name[len(full):]
+    return name
+
+
 async def build_topology(db: AsyncSession) -> dict:
-    """Build a topology graph from the latest snapshot per device.
+    """Build topology graphs from the latest snapshot per device.
 
-    Nodes come from the device inventory.  Edges are inferred from:
-    - BGP neighbor relationships (most reliable)
-    - Shared subnets between interfaces
+    Returns three separate edge lists for independent topology views:
+      - bgp_edges: BGP peering relationships
+      - subnet_edges: Shared L3 subnets
+      - l2_edges: Layer 2 adjacencies (ARP/MAC based)
 
-    Returns {"nodes": [...], "edges": [...]}.
+    Returns {"nodes": [...], "bgp_edges": [...], "subnet_edges": [...], "l2_edges": [...]}.
     """
     # Fetch all devices
     result = await db.execute(select(Device).order_by(Device.hostname))
     devices = list(result.scalars().all())
 
     if not devices:
-        return {"nodes": [], "edges": []}
+        return {"nodes": [], "bgp_edges": [], "l2_segments": []}
 
     # Fetch latest *successful* snapshot per device (has features_learned).
-    # A failed/empty snapshot from an interrupted run should not hide good data.
     latest_sq = (
         select(Snapshot.device_id, func.max(Snapshot.created_at).label("max_ts"))
         .where(func.array_length(Snapshot.features_learned, 1) > 0)
@@ -43,9 +62,11 @@ async def build_topology(db: AsyncSession) -> dict:
     )
     snapshots = {s.device_id: s for s in result.scalars().all()}
 
-    # Build IP → device_id mapping from interfaces
+    # ── Shared data structures ──────────────────────────────────
     ip_to_device: dict[str, str] = {}
-    device_subnets: dict[str, list[tuple[str, str]]] = {}  # device_id → [(ip, subnet)]
+    ip_to_intf: dict[str, tuple[str, str]] = {}  # IP → (device_id, intf_name)
+    device_subnets: dict[str, list[tuple[str, str, str]]] = {}  # dev → [(ip, subnet, intf)]
+    mac_to_device: dict[str, tuple[str, str]] = {}  # MAC → (device_id, intf_name)
 
     for device in devices:
         snap = snapshots.get(device.id)
@@ -55,9 +76,15 @@ async def build_topology(db: AsyncSession) -> dict:
         if not isinstance(interfaces, dict):
             continue
 
-        for _intf_name, intf_data in interfaces.items():
+        for intf_name, intf_data in interfaces.items():
             if not isinstance(intf_data, dict):
                 continue
+
+            # Register MAC → device for L2 discovery
+            mac = intf_data.get("mac_address") or intf_data.get("phys_address")
+            if mac:
+                mac_to_device[mac.lower().replace(".", "")] = (device.id, intf_name)
+
             if not intf_data.get("enabled") or intf_data.get("oper_status") != "up":
                 continue
             ipv4 = intf_data.get("ipv4", {})
@@ -66,19 +93,21 @@ async def build_topology(db: AsyncSession) -> dict:
             for addr_str in ipv4:
                 ip = addr_str.split("/")[0]
                 ip_to_device[ip] = device.id
-                # Compute /24 subnet for shared-subnet detection
-                parts = ip.split(".")
-                if len(parts) == 4:
-                    subnet = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
-                    device_subnets.setdefault(device.id, []).append((ip, subnet))
+                ip_to_intf[ip] = (device.id, intf_name)
+                try:
+                    iface = ipaddress.ip_interface(addr_str if "/" in addr_str else f"{addr_str}/24")
+                    subnet_str = str(iface.network)
+                except ValueError:
+                    parts = ip.split(".")
+                    subnet_str = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24" if len(parts) == 4 else ip
+                device_subnets.setdefault(device.id, []).append((ip, subnet_str, intf_name))
 
-        # Also register management IP
         if device.management_ip:
             ip_to_device[device.management_ip] = device.id
 
-    # Build edges from BGP neighbors
-    edges: list[dict] = []
-    edge_set: set[tuple[str, str]] = set()
+    # ── BGP edges ───────────────────────────────────────────────
+    bgp_edges: list[dict] = []
+    bgp_edge_set: set[tuple[str, str]] = set()
 
     for device in devices:
         snap = snapshots.get(device.id)
@@ -102,48 +131,130 @@ async def build_topology(db: AsyncSession) -> dict:
                         continue
 
                     pair = tuple(sorted([device.id, peer_device_id]))
-                    if pair in edge_set:
+                    if pair in bgp_edge_set:
                         continue
-                    edge_set.add(pair)
+                    bgp_edge_set.add(pair)
 
                     state = ndata.get("session_state", "Unknown")
                     health = "optimal" if state == "Established" else "critical"
 
-                    edges.append({
+                    peer_info = ip_to_intf.get(neighbor_ip)
+                    to_intf = _short_intf(peer_info[1]) if peer_info else ""
+
+                    from_intf = ""
+                    link_subnet = ""
+                    for lip, lsub, lname in device_subnets.get(device.id, []):
+                        try:
+                            if ipaddress.ip_address(neighbor_ip) in ipaddress.ip_network(lsub, strict=False):
+                                from_intf = _short_intf(lname)
+                                link_subnet = lsub
+                                break
+                        except ValueError:
+                            continue
+
+                    bgp_edges.append({
                         "from": device.id,
                         "to": peer_device_id,
                         "type": "bgp",
                         "health": health,
                         "label": f"eBGP AS{ndata.get('remote_as', '?')}",
                         "session_state": state,
+                        "from_intf": from_intf,
+                        "to_intf": to_intf,
+                        "subnet": link_subnet,
                     })
 
-    # Build edges from shared subnets (for devices not already linked by BGP)
-    subnet_members: dict[str, list[str]] = {}  # subnet → [device_ids]
-    for dev_id, subnets in device_subnets.items():
-        for _ip, subnet in subnets:
-            # Skip management subnet (too broad, connects everything)
-            if subnet.startswith("192.168.20."):
+    # ── Layer 2 segments (ARP/MAC, grouped by subnet) ─────────
+    # Build segments: for each subnet, collect the devices that can see
+    # each other via ARP on that subnet.  The frontend renders each
+    # segment as a hub node with spoke edges to the member devices.
+
+    def _normalise_mac(mac: str) -> str:
+        return mac.lower().replace(".", "").replace(":", "").replace("-", "")
+
+    # subnet_str → { device_id: { intf, ip, mac } }
+    segment_map: dict[str, dict[str, dict]] = {}
+
+    for device in devices:
+        snap = snapshots.get(device.id)
+        if not snap or not isinstance(snap.snapshot_data, dict):
+            continue
+        arp = snap.snapshot_data.get("arp", {})
+        if not isinstance(arp, dict):
+            continue
+
+        arp_interfaces = arp.get("interfaces", {})
+        for intf_name, intf_arp in arp_interfaces.items():
+            if not isinstance(intf_arp, dict):
                 continue
-            subnet_members.setdefault(subnet, []).append(dev_id)
 
-    for subnet, members in subnet_members.items():
-        unique = list(set(members))
-        for i in range(len(unique)):
-            for j in range(i + 1, len(unique)):
-                pair = tuple(sorted([unique[i], unique[j]]))
-                if pair in edge_set:
+            # Determine this interface's subnet
+            intf_subnet = ""
+            for lip, lsub, lname in device_subnets.get(device.id, []):
+                if lname == intf_name:
+                    intf_subnet = lsub
+                    break
+            if not intf_subnet or intf_subnet.startswith("192.168.20."):
+                continue
+
+            neighbors = intf_arp.get("ipv4", {}).get("neighbors", {})
+            if not isinstance(neighbors, dict):
+                continue
+
+            # Track which known devices appear on this subnet via ARP
+            seen_peers = set()
+            for neighbor_ip, ndata in neighbors.items():
+                if not isinstance(ndata, dict):
                     continue
-                edge_set.add(pair)
-                edges.append({
-                    "from": unique[i],
-                    "to": unique[j],
-                    "type": "subnet",
-                    "health": "optimal",
-                    "label": subnet,
-                })
+                remote_mac = ndata.get("link_layer_address", "")
+                if not remote_mac:
+                    continue
+                norm_mac = _normalise_mac(remote_mac)
+                peer = mac_to_device.get(norm_mac)
+                if not peer or peer[0] == device.id:
+                    continue
+                seen_peers.add((peer[0], peer[1], neighbor_ip, remote_mac))
 
-    # Load unmonitored interface settings for all devices
+            if not seen_peers:
+                continue
+
+            # Add self to segment
+            seg = segment_map.setdefault(intf_subnet, {})
+            if device.id not in seg:
+                # Find own IP on this subnet
+                own_ip = ""
+                for lip, lsub, lname in device_subnets.get(device.id, []):
+                    if lsub == intf_subnet and lname == intf_name:
+                        own_ip = lip
+                        break
+                seg[device.id] = {
+                    "device_id": device.id,
+                    "intf": _short_intf(intf_name),
+                    "ip": own_ip,
+                }
+
+            # Add peers to segment
+            for peer_dev_id, peer_intf, peer_ip, peer_mac in seen_peers:
+                if peer_dev_id not in seg:
+                    seg[peer_dev_id] = {
+                        "device_id": peer_dev_id,
+                        "intf": _short_intf(peer_intf),
+                        "ip": peer_ip,
+                        "mac": peer_mac,
+                    }
+
+    # Convert to list, filtering segments with fewer than 2 members
+    l2_segments: list[dict] = []
+    for subnet_str, members_dict in segment_map.items():
+        if len(members_dict) < 2:
+            continue
+        l2_segments.append({
+            "id": f"seg:{subnet_str}",
+            "subnet": subnet_str,
+            "members": list(members_dict.values()),
+        })
+
+    # ── Nodes ───────────────────────────────────────────────────
     unmonitored_keys = [f"unmonitored:{d.id}" for d in devices]
     unmonitored_map: dict[str, set[str]] = {}
     if unmonitored_keys:
@@ -154,7 +265,6 @@ async def build_topology(db: AsyncSession) -> dict:
             dev_id = setting.key.split(":", 1)[1]
             unmonitored_map[dev_id] = set(setting.value.get("interfaces", []))
 
-    # Build nodes
     nodes = []
     for device in devices:
         snap = snapshots.get(device.id)
@@ -177,7 +287,7 @@ async def build_topology(db: AsyncSession) -> dict:
 
         nodes.append({
             "id": device.id,
-            "hostname": device.hostname.split(".")[0],  # short name
+            "hostname": device.hostname.split(".")[0],
             "hostname_fqdn": device.hostname,
             "management_ip": device.management_ip,
             "platform": device.platform,
@@ -188,5 +298,14 @@ async def build_topology(db: AsyncSession) -> dict:
             "tags": device.tags or {},
         })
 
-    log.info("topology_built", nodes=len(nodes), edges=len(edges))
-    return {"nodes": nodes, "edges": edges}
+    log.info(
+        "topology_built",
+        nodes=len(nodes),
+        bgp_edges=len(bgp_edges),
+        l2_segments=len(l2_segments),
+    )
+    return {
+        "nodes": nodes,
+        "bgp_edges": bgp_edges,
+        "l2_segments": l2_segments,
+    }

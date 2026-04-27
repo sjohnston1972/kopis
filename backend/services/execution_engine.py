@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config import settings
 from db.tables import Approval, Device, Finding, Recommendation
 from services import approval_service
+from services.activity import activity_bus
 
 log = structlog.get_logger()
 
@@ -65,12 +66,26 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
         command_count=len(commands),
     )
 
+    act_id = activity_bus.start(
+        pipeline_run=f"exec:{approval_id}",
+        node="execution",
+        model="pyats",
+        device=device.hostname,
+        detail=f"Executing {len(commands)} commands on {device.hostname}",
+    )
+
     # Execute via pyATS/Netmiko (blocking — run in thread)
     import asyncio
     result = await asyncio.to_thread(_send_commands_sync, device, commands)
 
     # Update approval record
     success = not result.get("error")
+    duration = result.get("duration_seconds", 0)
+    if success:
+        activity_bus.complete(act_id, detail=f"Executed {len(commands)} commands on {device.hostname} in {duration}s")
+    else:
+        activity_bus.fail(act_id, f"Execution failed on {device.hostname}: {result.get('error', 'unknown')}")
+
     await approval_service.mark_executed(db, approval_id, result, success=success)
 
     # Update Jira ticket
@@ -78,10 +93,34 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
         from integrations.jira import jira_client
 
         status = "executed" if success else "failed"
-        comment = (
-            f"Execution {'succeeded' if success else 'FAILED'}.\n\n"
-            f"Command outputs:\n{{code}}\n{_format_outputs(result)}\n{{code}}"
+        duration = result.get("duration_seconds", 0)
+        cmd_count = len(result.get("outputs", []))
+        ok_count = sum(1 for o in result.get("outputs", []) if o.get("success"))
+
+        comment_parts = [
+            f"h3. Execution {'Succeeded' if success else 'FAILED'}",
+            f"*Device:* {device.hostname}",
+            f"*Duration:* {duration}s",
+            f"*Commands:* {ok_count}/{cmd_count} succeeded",
+        ]
+        if rec.agent_model:
+            comment_parts.append(f"*Remediation Model:* {rec.agent_model}")
+        if rec.reasoning:
+            comment_parts.append(f"\n*AI Reasoning:*\n{rec.reasoning}")
+        comment_parts.append(
+            f"\n*Command Outputs:*\n{{code}}\n{_format_outputs(result)}\n{{code}}"
         )
+        if rec.rollback_commands:
+            rb_list = rec.rollback_commands
+            if isinstance(rb_list[0], str):
+                rb_text = "\n".join(f"  {c}" for c in rb_list)
+            else:
+                rb_text = str(rb_list)
+            comment_parts.append(
+                f"\n*Rollback Commands (if needed):*\n{{code}}\n{rb_text}\n{{code}}"
+            )
+
+        comment = "\n".join(comment_parts)
         await jira_client.transition_issue(approval.jira_issue_key, status, comment)
 
     # Notify Slack
@@ -91,15 +130,45 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
         approval, "executed" if success else "failed"
     )
 
-    # Trigger verification snapshot
+    # Trigger verification snapshot + pipeline re-analysis
     if success:
+        snap_act_id = activity_bus.start(
+            pipeline_run=f"verify:{approval_id}",
+            node="verification",
+            model="pyats",
+            device=device.hostname,
+            detail=f"Taking verification snapshot of {device.hostname}",
+        )
         try:
             from services.snapshot_engine import take_snapshot
 
             log.info("verification_snapshot_start", hostname=device.hostname)
-            await take_snapshot(db, device_id=device.id, triggered_by="post-execution")
+            new_snaps = await take_snapshot(db, device_id=device.id, triggered_by="post-execution")
+            activity_bus.complete(snap_act_id, detail=f"Verification snapshot of {device.hostname} complete")
+
+            # Auto-trigger pipeline on the new snapshot
+            if new_snaps:
+                from agents.graph import run_pipeline
+                from services.snapshot_engine import get_snapshot_diff
+
+                for snap in new_snaps:
+                    try:
+                        diff_result = await get_snapshot_diff(db, snap.id)
+                        snapshot_diff = diff_result.get("changes", {})
+                        await run_pipeline(
+                            db=db,
+                            snapshot_id=snap.id,
+                            device_id=device.id,
+                            device_hostname=device.hostname,
+                            device_platform=device.platform,
+                            raw_snapshot=snap.snapshot_data,
+                            snapshot_diff=snapshot_diff,
+                        )
+                    except Exception as pipe_err:
+                        log.error("verification_pipeline_failed", hostname=device.hostname, error=str(pipe_err))
         except Exception as e:
             log.warning("verification_snapshot_failed", error=str(e))
+            activity_bus.fail(snap_act_id, f"Verification snapshot failed: {e}")
 
     return result
 

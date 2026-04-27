@@ -12,6 +12,7 @@ import structlog
 from agents.state import KopisState
 from config import settings
 from integrations.anthropic import anthropic_client
+from services.activity import activity_bus
 
 log = structlog.get_logger()
 
@@ -22,11 +23,33 @@ async def topology_node(state: KopisState) -> dict:
     """LangGraph node: classify findings from normalised data via Haiku."""
     hostname = state.get("device_hostname", "unknown")
     log.info("topology_start", hostname=hostname)
+    act_id = activity_bus.start(
+        pipeline_run=state.get("snapshot_id", ""),
+        node="topology",
+        model=settings.haiku_model,
+        device=hostname,
+        detail=f"Haiku classifying findings for {hostname}",
+    )
 
     normalised = state.get("normalised_data", {})
     interfaces = state.get("interface_summary", [])
     routing = state.get("routing_summary", [])
     anomalies = state.get("anomalies_detected", [])
+
+    # Include diff summary if available
+    diff = state.get("snapshot_diff", {})
+    diff_section = ""
+    if diff and not diff.get("note"):
+        # Summarise the diff — focus on key changes, not raw data
+        diff_str = json.dumps(diff, default=str, indent=2)
+        if len(diff_str) > 15_000:
+            diff_str = diff_str[:15_000] + "\n... [TRUNCATED]"
+        diff_section = (
+            f"## Changes Since Last Snapshot (DIFF)\n"
+            f"These are the specific changes detected between the previous and current snapshot. "
+            f"Pay close attention — removed ARP entries, routing changes, and BGP state transitions "
+            f"indicate real network events.\n```json\n{diff_str}\n```\n\n"
+        )
 
     prompt = (
         f"Device: {hostname} (platform: {state.get('device_platform', 'unknown')})\n\n"
@@ -34,6 +57,7 @@ async def topology_node(state: KopisState) -> dict:
         f"## Interface Summary\n```json\n{json.dumps(interfaces, default=str, indent=2)}\n```\n\n"
         f"## Routing Summary\n```json\n{json.dumps(routing, default=str, indent=2)}\n```\n\n"
         f"## Anomalies Detected by Normaliser\n```json\n{json.dumps(anomalies, default=str, indent=2)}\n```\n\n"
+        f"{diff_section}"
         "Analyse this device and produce your findings as specified."
     )
 
@@ -42,10 +66,12 @@ async def topology_node(state: KopisState) -> dict:
             prompt=prompt,
             system=SYSTEM_PROMPT,
             model=settings.haiku_model,
+            max_tokens=8192,
             temperature=0.15,
         )
     except Exception as e:
         log.error("topology_failed", hostname=hostname, error=str(e))
+        activity_bus.fail(act_id, f"Haiku analysis failed for {hostname}: {e}")
         return {
             "findings": [],
             "escalate_to_opus": False,
@@ -75,6 +101,13 @@ async def topology_node(state: KopisState) -> dict:
     else:
         next_stage = "complete"
 
+    severity_counts = {}
+    for f in findings:
+        s = f.get("severity", "unknown")
+        severity_counts[s] = severity_counts.get(s, 0) + 1
+    sev_str = ", ".join(f"{c} {s}" for s, c in severity_counts.items()) if severity_counts else "none"
+    esc_str = " → escalating to Opus" if escalate else ""
+    activity_bus.complete(act_id, tokens=tokens, detail=f"Haiku found {len(findings)} issues on {hostname} ({sev_str}){esc_str}")
     log.info(
         "topology_complete",
         hostname=hostname,

@@ -189,7 +189,7 @@ export default function ChatPanel({ state, onStateChange }) {
               <Icon name="smart_toy" className="text-on-primary text-[18px]" />
             </div>
             <div className="min-w-0">
-              <p className="text-xs font-bold text-on-surface">Kopis Assistant</p>
+              <p className="text-xs font-bold text-on-surface">Parity Assistant</p>
               <p className="text-[10px] text-on-surface-variant truncate">{streaming ? 'Typing...' : preview}</p>
             </div>
           </div>
@@ -238,7 +238,7 @@ export default function ChatPanel({ state, onStateChange }) {
             <Icon name="smart_toy" className="text-on-primary text-[18px]" />
           </div>
           <div>
-            <h3 className="text-sm font-bold text-on-surface">Kopis Assistant</h3>
+            <h3 className="text-sm font-bold text-on-surface">Parity Assistant</h3>
             <p className="text-[10px] text-on-surface-variant">Network operations AI</p>
           </div>
         </div>

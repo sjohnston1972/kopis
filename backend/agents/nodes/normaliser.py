@@ -14,6 +14,7 @@ import structlog
 
 from agents.state import KopisState
 from integrations.ollama import ollama_client
+from services.activity import activity_bus
 
 log = structlog.get_logger()
 
@@ -67,10 +68,26 @@ Rules:
 - Flag routing neighbours not in FULL/ESTABLISHED state.
 - Flag interfaces that are operationally down but admin-up.
 - Keep output compact. Do not include raw counters beyond what is specified.
+
+If a DIFF section is provided, it shows what changed since the last snapshot.
+Only flag changes that indicate a real problem or meaningful state transition:
+- ARP entries that were REMOVED (neighbour went away)
+- BGP session state changing AWAY from Established (session drop)
+- Interface oper_status changing from up to down
+- Routing entries being REMOVED (path withdrawal)
+
+Do NOT flag as anomalies:
+- Counter increments (packets, octets, errors going from e.g. 5 to 7)
+- Timer updates (keepalives, dead timers, hello timers)
+- Uptime or timestamp changes
+- Normal routing metric recalculations
+- ARP entries being ADDED (new neighbour is good)
+- Routes being ADDED (more reachability is good)
+- Any change that is part of normal protocol operation
 """
 
 
-def _fallback_normalise(raw: dict, hostname: str, platform: str) -> dict:
+def _fallback_normalise(raw: dict, hostname: str, platform: str, diff: dict | None = None) -> dict:
     """Extract key data directly from pyATS snapshot when Ollama is unavailable."""
     interface_summary = []
     anomalies = []
@@ -190,6 +207,63 @@ def _fallback_normalise(raw: dict, hostname: str, platform: str) -> dict:
             "serial": plat.get("chassis_sn") or plat.get("serial", None),
         }
 
+    # Diff-based change detection — only flag genuinely concerning changes
+    if diff and isinstance(diff, dict):
+        for key, change in diff.items():
+            if not isinstance(change, dict):
+                continue
+            status = change.get("status", "")
+
+            # ARP entries REMOVED — neighbour went away
+            if "arp" in key and status == "removed":
+                entity = key.split(".")
+                intf_name = entity[2] if len(entity) > 2 else "unknown"
+                detail = f"ARP entry removed: {key}"
+                if isinstance(change.get("value"), dict):
+                    neighbors = change["value"].get("neighbors", {})
+                    if neighbors:
+                        ips = list(neighbors.keys())
+                        detail = f"ARP neighbours lost on {intf_name}: {', '.join(ips)}"
+                anomalies.append({
+                    "type": "state_change",
+                    "entity": intf_name,
+                    "detail": detail,
+                })
+
+            # Routing entries REMOVED — path withdrawal (not added — that's good)
+            elif "routing" in key and status == "removed":
+                anomalies.append({
+                    "type": "state_change",
+                    "entity": key.split(".")[-1] if "." in key else key,
+                    "detail": f"Route withdrawn: {key}",
+                })
+
+            # BGP session state changing AWAY from Established
+            elif "bgp" in key and "session_state" in key and status == "changed":
+                new_state = change.get("new", "")
+                old_state = change.get("old", "")
+                if old_state == "Established" and new_state != "Established":
+                    anomalies.append({
+                        "type": "state_change",
+                        "entity": key,
+                        "detail": f"BGP session dropped from {old_state} to {new_state}",
+                    })
+            elif "bgp" in key and "neighbor" in key and status == "removed":
+                anomalies.append({
+                    "type": "state_change",
+                    "entity": key,
+                    "detail": f"BGP neighbour data removed: {key}",
+                })
+
+            # Interface going DOWN (not up — that's recovery)
+            elif "interface" in key and "oper_status" in key and status == "changed":
+                if change.get("new") == "down" and change.get("old") == "up":
+                    anomalies.append({
+                        "type": "state_change",
+                        "entity": key,
+                        "detail": f"Interface went down (was {change.get('old')})",
+                    })
+
     return {
         "interface_summary": interface_summary,
         "routing_summary": routing_summary,
@@ -204,13 +278,29 @@ async def normaliser_node(state: KopisState) -> dict:
     raw = state.get("raw_snapshot", {})
 
     log.info("normaliser_start", hostname=hostname)
+    act_id = activity_bus.start(
+        pipeline_run=state.get("snapshot_id", ""),
+        node="normaliser",
+        model=ollama_client.model,
+        device=hostname,
+        detail=f"Ollama extracting key facts from {hostname} snapshot",
+    )
 
     # Truncate large snapshots to fit context window
     raw_str = json.dumps(raw, default=str)
     if len(raw_str) > 60_000:
         raw_str = raw_str[:60_000] + "\n... [TRUNCATED]"
 
-    prompt = f"Device hostname: {hostname}\nPlatform: {state.get('device_platform', 'unknown')}\n\nRaw pyATS data:\n{raw_str}"
+    # Include diff data if available
+    diff = state.get("snapshot_diff", {})
+    diff_section = ""
+    if diff and not diff.get("note"):
+        diff_str = json.dumps(diff, default=str)
+        if len(diff_str) > 20_000:
+            diff_str = diff_str[:20_000] + "\n... [TRUNCATED]"
+        diff_section = f"\n\n## DIFF (changes since last snapshot):\n{diff_str}"
+
+    prompt = f"Device hostname: {hostname}\nPlatform: {state.get('device_platform', 'unknown')}\n\nRaw pyATS data:\n{raw_str}{diff_section}"
 
     try:
         result = await ollama_client.generate(
@@ -220,7 +310,9 @@ async def normaliser_node(state: KopisState) -> dict:
         )
     except Exception as e:
         log.warning("normaliser_ollama_failed_using_fallback", hostname=hostname, error=str(e))
-        fallback = _fallback_normalise(raw, hostname, state.get("device_platform", "unknown"))
+        activity_bus.thinking(act_id, f"Ollama unavailable — using deterministic fallback for {hostname}")
+        fallback = _fallback_normalise(raw, hostname, state.get("device_platform", "unknown"), state.get("snapshot_diff"))
+        activity_bus.complete(act_id, detail=f"Fallback normaliser: {len(fallback.get('anomalies_detected', []))} anomalies on {hostname}")
         return {
             "normalised_data": fallback,
             "interface_summary": fallback.get("interface_summary", []),
@@ -237,6 +329,7 @@ async def normaliser_node(state: KopisState) -> dict:
 
     if result.get("_parse_error"):
         log.warning("normaliser_parse_error", hostname=hostname)
+        activity_bus.fail(act_id, f"Ollama returned invalid JSON for {hostname}")
         return {
             "normalised_data": {},
             "interface_summary": [],
@@ -247,11 +340,13 @@ async def normaliser_node(state: KopisState) -> dict:
             "tokens_used": token_tracking,
         }
 
+    anomaly_count = len(result.get("anomalies_detected", []))
+    activity_bus.complete(act_id, tokens=tokens, detail=f"Ollama normalised {hostname}: {anomaly_count} anomalies flagged")
     log.info(
         "normaliser_complete",
         hostname=hostname,
         interfaces=len(result.get("interface_summary", [])),
-        anomalies=len(result.get("anomalies_detected", [])),
+        anomalies=anomaly_count,
     )
 
     return {

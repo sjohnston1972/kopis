@@ -12,7 +12,7 @@ export default function TopNav() {
   return (
     <header className="flex items-center justify-between px-6 w-full sticky top-0 z-40 bg-white h-16 shadow-sm text-sm font-medium tracking-tight">
       <div className="flex items-center gap-8">
-        <span className="text-xl font-bold tracking-tighter text-slate-900">Kopis</span>
+        <span className="text-xl font-bold tracking-tighter text-slate-900">Parity</span>
         <div className="hidden md:flex items-center gap-6">
           {navLinks.map((link) => (
             <NavLink

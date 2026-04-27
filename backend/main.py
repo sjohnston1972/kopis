@@ -1,12 +1,17 @@
 """Kopis — FastAPI application entry point."""
 
+import logging
+import sys
 from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI
 
-from api.routes import approvals, chat, dashboard, devices, execution, findings, health, pipeline, snapshots, topology
+from api.routes import approvals, chat, dashboard, devices, execution, findings, health, pipeline, schedules, snapshots, topology
 from db.postgres import engine
+from services import scheduler
+
+logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 
 structlog.configure(
     processors=[
@@ -40,11 +45,40 @@ async def _reset_stale_snapshot_status():
             await db.commit()
 
 
+async def _reset_orphaned_approvals():
+    """Mark any 'approved' (executing) approvals as failed on startup.
+
+    If the container restarted while an execution was in-flight, the
+    asyncio.create_task was lost.  These approvals would otherwise be
+    stuck in 'approved' forever.
+    """
+    from db.postgres import async_session
+    from db.tables import Approval
+    from sqlalchemy import select
+
+    async with async_session() as db:
+        result = await db.execute(
+            select(Approval).where(Approval.status == "approved")
+        )
+        stuck = result.scalars().all()
+        for a in stuck:
+            a.status = "failed"
+            a.execution_result = {"error": "Execution lost — container restarted before completion"}
+            log.warning("orphaned_approval_reset", approval_id=a.id)
+        if stuck:
+            await db.commit()
+            log.info("orphaned_approvals_fixed", count=len(stuck))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("kopis_starting")
     await _reset_stale_snapshot_status()
+    await _reset_orphaned_approvals()
+    scheduler.start()
+    await scheduler.load_persistent_schedules()
     yield
+    scheduler.shutdown()
     await engine.dispose()
     log.info("kopis_shutdown")
 
@@ -66,3 +100,4 @@ app.include_router(topology.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
 app.include_router(pipeline.router, prefix="/api/v1")
 app.include_router(execution.router, prefix="/api/v1")
+app.include_router(schedules.router, prefix="/api/v1")

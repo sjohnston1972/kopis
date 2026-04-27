@@ -2,46 +2,66 @@ import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import Icon from '../components/Icon';
-import StatusChip from '../components/StatusChip';
 
 // ── Layout helpers ───────────────────────────────────────────
 
 function layoutNodes(nodes, edges) {
-  // Determine tiers: firewalls → routers → switches, positioned top to bottom
-  const tiers = { firewall: 0, router: 1, switch: 2, unknown: 2 };
+  const tiers = { firewall: 0, router: 1, switch: 2, segment: 3, unknown: 2 };
   const grouped = {};
   nodes.forEach((n) => {
-    const tier = tiers[n.device_type] ?? 2;
+    const tier = n._isSegment ? 3 : (tiers[n.device_type] ?? 2);
     (grouped[tier] = grouped[tier] || []).push(n);
   });
-
-  // Sort within each tier by hostname for stable ordering
   Object.values(grouped).forEach((g) => g.sort((a, b) => a.hostname.localeCompare(b.hostname)));
 
   const positions = {};
   const tierKeys = Object.keys(grouped).sort((a, b) => a - b);
-  const TIER_Y_GAP = 200;
+  const TIER_Y_GAP = 180;
   const NODE_X_GAP = 160;
+  const SEG_X_GAP = 140;
   const PADDING_X = 80;
   const START_Y = 60;
-
-  // Find widest tier to center others
-  const maxWidth = Math.max(...tierKeys.map((t) => (grouped[t].length - 1) * NODE_X_GAP));
+  const maxWidth = Math.max(...tierKeys.map((t) => {
+    const gap = grouped[t][0]?._isSegment ? SEG_X_GAP : NODE_X_GAP;
+    return (grouped[t].length - 1) * gap;
+  }));
 
   tierKeys.forEach((tier, tierIdx) => {
     const group = grouped[tier];
-    const tierWidth = (group.length - 1) * NODE_X_GAP;
+    const isSegTier = group[0]?._isSegment;
+    const gap = isSegTier ? SEG_X_GAP : NODE_X_GAP;
+    const tierWidth = (group.length - 1) * gap;
     const offsetX = PADDING_X + (maxWidth - tierWidth) / 2;
     const y = START_Y + tierIdx * TIER_Y_GAP;
     group.forEach((node, i) => {
-      positions[node.id] = { x: offsetX + i * NODE_X_GAP, y };
+      positions[node.id] = { x: offsetX + i * gap, y };
     });
   });
-
   return positions;
 }
 
-// ── Colors / icons ───────────────────────────────────────────
+// ── View configuration ──────────────────────────────────────
+
+const VIEWS = {
+  bgp: {
+    key: 'bgp',
+    label: 'Layer 3',
+    icon: 'swap_horiz',
+    edgeField: 'bgp_edges',
+    color: '#0063eb',
+    description: 'BGP peering relationships',
+    edgeStyle: { dash: undefined, width: 2.5 },
+  },
+  l2: {
+    key: 'l2',
+    label: 'Layer 2',
+    icon: 'cable',
+    edgeField: 'l2_edges',
+    color: '#7b1fa2',
+    description: 'ARP/MAC adjacencies',
+    edgeStyle: { dash: '3 2', width: 1.5 },
+  },
+};
 
 const DEVICE_ICONS = {
   router: 'router',
@@ -50,10 +70,10 @@ const DEVICE_ICONS = {
   unknown: 'device_unknown',
 };
 
-const EDGE_COLORS = {
-  optimal: { stroke: '#006c4f', label: 'Optimal' },
-  congested: { stroke: '#e88a0c', label: 'Congested' },
-  critical: { stroke: '#ba1a1a', label: 'Critical' },
+const EDGE_HEALTH_COLORS = {
+  optimal: '#006c4f',
+  congested: '#e88a0c',
+  critical: '#ba1a1a',
 };
 
 const ZONE_COLORS = [
@@ -65,12 +85,7 @@ const ZONE_COLORS = [
   { fill: 'rgba(186, 26, 26, 0.06)', stroke: 'rgba(186, 26, 26, 0.25)', text: '#ba1a1a' },
 ];
 
-const EDGE_TYPE_STYLE = {
-  bgp: { dash: undefined, width: 2.5 },
-  subnet: { dash: '6 3', width: 1.5 },
-};
-
-// ── Components ───────────────────────────────────────────────
+// ── Sub-components ──────────────────────────────────────────
 
 function ToolbarButton({ icon, onClick, label, active }) {
   return (
@@ -86,7 +101,31 @@ function ToolbarButton({ icon, onClick, label, active }) {
   );
 }
 
-function DeviceNode({ node, pos, selected, onClick, edgeCount, onDragStart }) {
+function SegmentNode({ node, pos, selected, onClick, onDragStart }) {
+  const memberCount = node._memberCount || 0;
+  return (
+    <g
+      transform={`translate(${pos.x}, ${pos.y})`}
+      onClick={(e) => onClick(node, e)}
+      onMouseDown={(e) => onDragStart(e, node.id)}
+      className="cursor-grab active:cursor-grabbing"
+    >
+      <rect
+        x={-52} y={-18} width={104} height={36} rx={8}
+        className={selected ? 'fill-[#7b1fa2]/10 stroke-[#7b1fa2]' : 'fill-surface-container-lowest stroke-outline-variant/60'}
+        strokeWidth={selected ? 2 : 1}
+      />
+      <text y={1} textAnchor="middle" className="text-[10px] font-bold font-mono fill-current text-on-surface select-none">
+        {node.hostname}
+      </text>
+      <text y={13} textAnchor="middle" className="text-[8px] fill-current text-on-surface-variant select-none">
+        {memberCount} device{memberCount !== 1 ? 's' : ''}
+      </text>
+    </g>
+  );
+}
+
+function DeviceNode({ node, pos, selected, onClick, onDragStart }) {
   const isFirewall = node.device_type === 'firewall';
   const hasSnap = node.has_snapshot;
   const icon = DEVICE_ICONS[node.device_type] || DEVICE_ICONS.unknown;
@@ -117,28 +156,15 @@ function DeviceNode({ node, pos, selected, onClick, edgeCount, onDragStart }) {
       onMouseDown={(e) => onDragStart(e, node.id)}
       className="cursor-grab active:cursor-grabbing"
     >
-      {/* Background circle */}
       <circle cx={0} cy={0} r={28} className={`fill-current ${selected ? 'text-primary/5' : 'text-transparent'}`} />
-
-      {/* Node body — use foreignObject for Tailwind styling */}
       <foreignObject x={-24} y={-24} width={48} height={48}>
-        <div
-          className={`w-12 h-12 rounded-xl ${bgCls} ${ringCls} flex items-center justify-center shadow-sm transition-all hover:scale-110 hover:shadow-md`}
-        >
+        <div className={`w-12 h-12 rounded-xl ${bgCls} ${ringCls} flex items-center justify-center shadow-sm transition-all hover:scale-110 hover:shadow-md`}>
           <Icon name={icon} className={`text-[22px] ${iconCls}`} />
         </div>
       </foreignObject>
-
-      {/* Label */}
-      <text
-        y={40}
-        textAnchor="middle"
-        className="text-[11px] font-bold fill-current text-on-surface-variant select-none"
-      >
+      <text y={40} textAnchor="middle" className="text-[11px] font-bold fill-current text-on-surface-variant select-none">
         {node.hostname}
       </text>
-
-      {/* No snapshot indicator */}
       {!hasSnap && (
         <foreignObject x={14} y={-30} width={18} height={18}>
           <div className="w-4 h-4 rounded-full bg-outline-variant/40 flex items-center justify-center">
@@ -150,61 +176,125 @@ function DeviceNode({ node, pos, selected, onClick, edgeCount, onDragStart }) {
   );
 }
 
-function EdgeLine({ edge, fromPos, toPos, showLabels }) {
-  const style = EDGE_TYPE_STYLE[edge.type] || EDGE_TYPE_STYLE.subnet;
-  const color = EDGE_COLORS[edge.health]?.stroke || EDGE_COLORS.optimal.stroke;
+function EdgeLine({ edge, fromPos, toPos, showLabels, viewConfig }) {
+  const style = viewConfig.edgeStyle;
+  const color = EDGE_HEALTH_COLORS[edge.health] || viewConfig.color;
 
   const mx = (fromPos.x + toPos.x) / 2;
   const my = (fromPos.y + toPos.y) / 2;
 
+  const fromLx = fromPos.x + (toPos.x - fromPos.x) * 0.18;
+  const fromLy = fromPos.y + (toPos.y - fromPos.y) * 0.18;
+  const toLx = fromPos.x + (toPos.x - fromPos.x) * 0.82;
+  const toLy = fromPos.y + (toPos.y - fromPos.y) * 0.82;
+
+  const dx = toPos.x - fromPos.x;
+  const dy = toPos.y - fromPos.y;
+  const len = Math.sqrt(dx * dx + dy * dy) || 1;
+  const perpX = (-dy / len) * 10;
+  const perpY = (dx / len) * 10;
+
+  const centerLabel = edge.label || '';
+  const subnetLabel = edge.subnet && edge.subnet !== edge.label ? edge.subnet : '';
+  const centerLines = [centerLabel, subnetLabel].filter(Boolean);
+  const centerHeight = centerLines.length * 12 + 6;
+
   return (
     <g>
       <line
-        x1={fromPos.x}
-        y1={fromPos.y}
-        x2={toPos.x}
-        y2={toPos.y}
-        stroke={color}
-        strokeWidth={style.width}
-        strokeOpacity={0.5}
-        strokeDasharray={style.dash}
+        x1={fromPos.x} y1={fromPos.y} x2={toPos.x} y2={toPos.y}
+        stroke={color} strokeWidth={style.width} strokeOpacity={0.5} strokeDasharray={style.dash}
       />
-      {showLabels && edge.label && (
+      {showLabels && (
         <>
-          <rect
-            x={mx - 40}
-            y={my - 8}
-            width={80}
-            height={16}
-            rx={4}
-            fill="white"
-            fillOpacity={0.9}
-            stroke={color}
-            strokeWidth={0.5}
-          />
-          <text
-            x={mx}
-            y={my + 3.5}
-            textAnchor="middle"
-            className="text-[9px] font-bold select-none"
-            fill={color}
-          >
-            {edge.label}
-          </text>
+          {centerLines.length > 0 && (
+            <>
+              <rect
+                x={mx - 48} y={my - centerHeight / 2} width={96} height={centerHeight}
+                rx={4} fill="white" fillOpacity={0.92} stroke={color} strokeWidth={0.5}
+              />
+              {centerLines.map((line, i) => (
+                <text
+                  key={i} x={mx} y={my - ((centerLines.length - 1) * 6) + i * 12 + 4}
+                  textAnchor="middle"
+                  className={`select-none ${i === 0 ? 'text-[9px] font-bold' : 'text-[8px] font-medium'}`}
+                  fill={i === 0 ? color : '#6b7280'}
+                >
+                  {line}
+                </text>
+              ))}
+            </>
+          )}
+          {edge.from_intf && (
+            <text x={fromLx + perpX} y={fromLy + perpY} textAnchor="middle" className="text-[8px] font-mono font-semibold select-none" fill="#6b7280">
+              {edge.from_intf}
+            </text>
+          )}
+          {edge.to_intf && (
+            <text x={toLx + perpX} y={toLy + perpY} textAnchor="middle" className="text-[8px] font-mono font-semibold select-none" fill="#6b7280">
+              {edge.to_intf}
+            </text>
+          )}
         </>
       )}
     </g>
   );
 }
 
-function DetailPanel({ node, edges, allNodes, onClose }) {
+function SegmentDetailPanel({ node, edges, allNodes, onClose }) {
+  const nodeMap = {};
+  allNodes.forEach((n) => { nodeMap[n.id] = n; });
+  const members = node._members || [];
+
+  return (
+    <div className="w-[380px] shrink-0 bg-surface-container-low border-l border-outline-variant/40 flex flex-col overflow-y-auto">
+      <div className="p-6 pb-4 border-b border-outline-variant/30">
+        <div className="flex items-center justify-between mb-3">
+          <span className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">L2 Segment</span>
+          <button onClick={onClose} className="p-1 rounded-lg hover:bg-surface-container-high transition-colors">
+            <Icon name="close" className="text-lg text-on-surface-variant" />
+          </button>
+        </div>
+        <h2 className="text-xl font-extrabold font-mono text-on-surface">{node.hostname}</h2>
+        <p className="text-xs text-on-surface-variant mt-1">{members.length} connected device{members.length !== 1 ? 's' : ''}</p>
+      </div>
+
+      <div className="px-6 py-4 flex-1">
+        <p className="text-[10px] font-bold tracking-widest text-on-surface-variant uppercase mb-3">Members</p>
+        <div className="space-y-2">
+          {members.map((m, i) => {
+            const dev = nodeMap[m.device_id];
+            return (
+              <div key={i} className="bg-surface-container-lowest rounded-lg px-4 py-3">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
+                    <Icon name={DEVICE_ICONS[dev?.device_type] || 'device_unknown'} className="text-base text-primary" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs font-bold text-on-surface truncate">{dev?.hostname || m.device_id.slice(0, 8)}</div>
+                    <div className="text-[10px] text-on-surface-variant font-mono">{m.ip}</div>
+                  </div>
+                  <span className="text-[10px] font-mono text-on-surface-variant bg-surface-container-high px-2 py-0.5 rounded">{m.intf}</span>
+                </div>
+                {m.mac && (
+                  <div className="mt-1.5 ml-11 text-[10px] font-mono text-on-surface-variant/60">{m.mac}</div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DetailPanel({ node, edges, allNodes, onClose, viewConfig }) {
   const nodeEdges = edges.filter((e) => e.from === node.id || e.to === node.id);
   const nodeMap = {};
   allNodes.forEach((n) => { nodeMap[n.id] = n; });
 
   return (
     <div className="w-[380px] shrink-0 bg-surface-container-low border-l border-outline-variant/40 flex flex-col overflow-y-auto">
-      {/* Header */}
       <div className="p-6 pb-4 border-b border-outline-variant/30">
         <div className="flex items-center justify-between mb-3">
           <span className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">
@@ -228,7 +318,6 @@ function DetailPanel({ node, edges, allNodes, onClose }) {
         </div>
       </div>
 
-      {/* Interfaces summary */}
       <div className="p-6 pb-2">
         <p className="text-[10px] font-bold tracking-widest text-on-surface-variant uppercase mb-3">Interfaces</p>
         <div className="grid grid-cols-2 gap-3">
@@ -243,53 +332,73 @@ function DetailPanel({ node, edges, allNodes, onClose }) {
         </div>
       </div>
 
-      {/* Neighbors */}
       <div className="px-6 py-4 flex-1">
         <p className="text-[10px] font-bold tracking-widest text-on-surface-variant uppercase mb-3">
-          Connections ({nodeEdges.length})
+          {viewConfig.label} Connections ({nodeEdges.length})
         </p>
         <div className="space-y-2">
           {nodeEdges.map((edge, i) => {
             const peerId = edge.from === node.id ? edge.to : edge.from;
             const peer = nodeMap[peerId];
-            const healthColor = EDGE_COLORS[edge.health];
+            const healthColor = EDGE_HEALTH_COLORS[edge.health] || viewConfig.color;
             return (
-              <div key={i} className="flex items-center gap-3 bg-surface-container-lowest rounded-lg px-4 py-3">
-                <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center">
-                  <Icon
-                    name={DEVICE_ICONS[peer?.device_type] || 'device_unknown'}
-                    className="text-base text-primary"
-                  />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="text-xs font-bold text-on-surface truncate">
-                    {peer?.hostname || peerId.slice(0, 8)}
+              <div key={i} className="bg-surface-container-lowest rounded-lg px-4 py-3">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
+                    <Icon name={DEVICE_ICONS[peer?.device_type] || 'device_unknown'} className="text-base text-primary" />
                   </div>
-                  <div className="text-[10px] text-on-surface-variant">{edge.label}</div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs font-bold text-on-surface truncate">
+                      {peer?.hostname || peerId.slice(0, 8)}
+                    </div>
+                    <div className="text-[10px] text-on-surface-variant">{edge.label}</div>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full" style={{ backgroundColor: healthColor }} />
+                    <span className="text-[10px] font-bold text-on-surface-variant capitalize">{edge.type}</span>
+                  </div>
                 </div>
-                <div className="flex items-center gap-1.5">
-                  <span
-                    className="w-2 h-2 rounded-full"
-                    style={{ backgroundColor: healthColor?.stroke || '#006c4f' }}
-                  />
-                  <span className="text-[10px] font-bold text-on-surface-variant capitalize">
-                    {edge.type}
-                  </span>
-                </div>
+                {(edge.from_intf || edge.to_intf || edge.subnet) && (
+                  <div className="mt-2 ml-11 flex flex-wrap items-center gap-x-3 gap-y-1">
+                    {(() => {
+                      const localIntf = edge.from === node.id ? edge.from_intf : edge.to_intf;
+                      const remoteIntf = edge.from === node.id ? edge.to_intf : edge.from_intf;
+                      return (
+                        <>
+                          {localIntf && (
+                            <span className="text-[10px] font-mono text-on-surface-variant">
+                              <span className="text-[9px] text-outline-variant">local</span> {localIntf}
+                            </span>
+                          )}
+                          {remoteIntf && (
+                            <span className="text-[10px] font-mono text-on-surface-variant">
+                              <span className="text-[9px] text-outline-variant">remote</span> {remoteIntf}
+                            </span>
+                          )}
+                          {edge.subnet && (
+                            <span className="text-[10px] font-mono text-on-surface-variant/70">{edge.subnet}</span>
+                          )}
+                          {edge.mac && (
+                            <span className="text-[10px] font-mono text-on-surface-variant/70">{edge.mac}</span>
+                          )}
+                        </>
+                      );
+                    })()}
+                  </div>
+                )}
               </div>
             );
           })}
           {nodeEdges.length === 0 && (
             <div className="flex flex-col items-center py-6 text-on-surface-variant">
               <Icon name="link_off" className="text-2xl mb-2 opacity-40" />
-              <p className="text-xs font-semibold">No connections detected</p>
+              <p className="text-xs font-semibold">No {viewConfig.label.toLowerCase()} connections detected</p>
               <p className="text-[10px] mt-1 opacity-60">Take a snapshot to discover neighbors</p>
             </div>
           )}
         </div>
       </div>
 
-      {/* Snapshot status */}
       <div className="px-6 py-4 border-t border-outline-variant/30">
         <div className="flex items-center gap-2">
           <Icon
@@ -305,101 +414,115 @@ function DetailPanel({ node, edges, allNodes, onClose }) {
   );
 }
 
-// ── Main component ───────────────────────────────────────────
+// ── Topology Canvas (one per view) ──────────────────────────
 
-export default function Topology() {
-  const { data: topologyData, loading, refetch } = useApi(api.topology);
+function TopologyCanvas({ nodes, edges, viewConfig, active }) {
   const [selectedNode, setSelectedNode] = useState(null);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [showLabels, setShowLabels] = useState(false);
-  const [filterType, setFilterType] = useState('bgp');
-  const [mode, setMode] = useState('pointer'); // 'pointer' | 'select'
+  const [showLabels, setShowLabels] = useState(true);
+  const [mode, setMode] = useState('pointer');
   const svgRef = useRef(null);
   const containerRef = useRef(null);
   const isPanning = useRef(false);
   const lastMouse = useRef({ x: 0, y: 0 });
 
-  const nodes = topologyData?.nodes || [];
-  const edges = topologyData?.edges || [];
-
-  // Filter edges by type
-  const filteredEdges = filterType === 'all'
-    ? edges
-    : edges.filter((e) => e.type === filterType);
-
-  // Layout — initialize from auto-layout, then allow dragging
-  // Layout is always computed from ALL edges — changing the filter should not reposition nodes
   const initialPositions = useMemo(() => layoutNodes(nodes, edges), [nodes, edges]);
   const [positions, setPositions] = useState({});
   const [selectedIds, setSelectedIds] = useState(new Set());
-  const [selRect, setSelRect] = useState(null); // { x1,y1,x2,y2 } in SVG coords
-  const [zones, setZones] = useState([]); // [{ id, x, y, w, h, label, color }]
-  const [editingZone, setEditingZone] = useState(null); // zone id being label-edited
-  const dragging = useRef(null); // { id, startX, startY, origins: {id: {x,y}} }
-  const selecting = useRef(null); // { startClientX, startClientY }
-  const drawingZone = useRef(null); // { x1, y1 } in SVG coords
-  const serverLayout = useRef(null); // loaded layout from API
-  const layoutReady = useRef(false); // prevents saving before initial load completes
-  const userModified = useRef(false); // true once user drags a node or edits zones
+  const [selRect, setSelRect] = useState(null);
+  const [zones, setZones] = useState([]);
+  const [editingZone, setEditingZone] = useState(null);
+  const dragging = useRef(null);
+  const selecting = useRef(null);
+  const drawingZone = useRef(null);
+  const serverLayout = useRef(null);
+  const layoutReady = useRef(false);
+  const userModified = useRef(false);
+  const [layoutLoaded, setLayoutLoaded] = useState(0); // bumped when layout arrives
 
-  // Load saved layout from server on mount
+  // Load saved layout for this view
   useEffect(() => {
-    api.topologyLayout().then((data) => {
+    layoutReady.current = false;
+    userModified.current = false;
+    api.topologyLayout(viewConfig.key).then((data) => {
       serverLayout.current = data;
       if (data.zones?.length) setZones(data.zones);
       layoutReady.current = true;
-    }).catch(() => { layoutReady.current = true; });
-  }, []);
+      setLayoutLoaded((c) => c + 1); // trigger positions re-sync
+    }).catch(() => { layoutReady.current = true; setLayoutLoaded((c) => c + 1); });
+  }, [viewConfig.key]);
 
-  // Sync positions when topology data changes, restoring saved positions
+  // Sync positions when topology data or saved layout changes
   useEffect(() => {
     const saved = serverLayout.current?.positions || {};
     setPositions(() => {
       const next = { ...initialPositions };
       for (const id in saved) {
-        if (next[id]) {
-          next[id] = { ...saved[id], _dragged: true };
-        }
+        if (next[id]) next[id] = { ...saved[id], _dragged: true };
       }
       return next;
     });
-  }, [initialPositions]);
+  }, [initialPositions, layoutLoaded]);
 
-  // Debounced save to server when positions or zones change (only after user interaction)
+  // Save helper — builds payload and sends to API
+  const doSave = useCallback((pos, z) => {
+    const dragged = {};
+    for (const id in pos) {
+      if (pos[id]._dragged) dragged[id] = { x: pos[id].x, y: pos[id].y };
+    }
+    api.saveTopologyLayout(viewConfig.key, { positions: dragged, zones: z }).catch(() => {});
+  }, [viewConfig.key]);
+
+  // Debounced save on position/zone changes
   const saveTimer = useRef(null);
   useEffect(() => {
     if (!layoutReady.current || !userModified.current) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => {
-      const dragged = {};
-      for (const id in positions) {
-        if (positions[id]._dragged) {
-          dragged[id] = { x: positions[id].x, y: positions[id].y };
-        }
-      }
-      api.saveTopologyLayout({ positions: dragged, zones }).catch(() => {});
-    }, 1000);
+    saveTimer.current = setTimeout(() => doSave(positions, zones), 800);
     return () => clearTimeout(saveTimer.current);
-  }, [positions, zones]);
+  }, [positions, zones, doSave]);
 
-  // Calculate SVG viewBox from positions
+  // Keep latest values in refs for unmount flush
+  const positionsRef = useRef(positions);
+  const zonesRef = useRef(zones);
+  positionsRef.current = positions;
+  zonesRef.current = zones;
+  const doSaveRef = useRef(doSave);
+  doSaveRef.current = doSave;
+
+  // Flush pending save on unmount
+  useEffect(() => {
+    return () => {
+      if (saveTimer.current) {
+        clearTimeout(saveTimer.current);
+        if (userModified.current) doSaveRef.current(positionsRef.current, zonesRef.current);
+      }
+    };
+  }, []);
+
+  // ViewBox
   const viewBox = useMemo(() => {
     const xs = Object.values(positions).map((p) => p.x);
     const ys = Object.values(positions).map((p) => p.y);
     if (!xs.length) return { x: 0, y: 0, w: 1200, h: 700 };
     const pad = 100;
-    const minX = Math.min(...xs) - pad;
-    const minY = Math.min(...ys) - pad;
-    const maxX = Math.max(...xs) + pad;
-    const maxY = Math.max(...ys) + pad + 50;
-    return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+    return {
+      x: Math.min(...xs) - pad, y: Math.min(...ys) - pad,
+      w: Math.max(...xs) - Math.min(...xs) + pad * 2,
+      h: Math.max(...ys) - Math.min(...ys) + pad * 2 + 50,
+    };
   }, [positions]);
 
   // Zoom-to-fit on initial load
   const hasFitted = useRef(false);
   useEffect(() => {
-    if (hasFitted.current) return;
+    if (!active) return;
+    hasFitted.current = false;
+  }, [viewConfig.key, active]);
+
+  useEffect(() => {
+    if (hasFitted.current || !active) return;
     const container = containerRef.current;
     if (!container || Object.keys(positions).length === 0) return;
     hasFitted.current = true;
@@ -410,25 +533,23 @@ export default function Topology() {
       if (!cw || !ch || !viewBox.w || !viewBox.h) return;
       const scaleX = cw / viewBox.w;
       const scaleY = ch / viewBox.h;
-      const fitZoom = Math.min(scaleX, scaleY, 1.5) * 0.9; // 90% to add breathing room, cap at 1.5x
+      const fitZoom = Math.min(scaleX, scaleY, 1.5) * 0.9;
       const contentCx = viewBox.x + viewBox.w / 2;
       const contentCy = viewBox.y + viewBox.h / 2;
-      const fitPanX = cw / 2 - contentCx * fitZoom;
-      const fitPanY = ch / 2 - contentCy * fitZoom;
       setZoom(fitZoom);
-      setPan({ x: fitPanX, y: fitPanY });
+      setPan({ x: cw / 2 - contentCx * fitZoom, y: ch / 2 - contentCy * fitZoom });
     });
-  }, [positions, viewBox]);
+  }, [positions, viewBox, active]);
 
-  // All interaction state is stored in refs to avoid stale closures.
-  // A single forceUpdate counter triggers re-renders when needed.
   const [, forceRender] = useState(0);
   const stateRef = useRef({ pan, zoom, positions, selectedIds, mode, zones, selRect });
   stateRef.current = { pan, zoom, positions, selectedIds, mode, zones, selRect };
 
-  // Node drag start
+  const didDrag = useRef(false);
+
   const handleNodeDragStart = useCallback((e, nodeId) => {
     e.stopPropagation();
+    didDrag.current = false;
     const { positions: pos, selectedIds: sel } = stateRef.current;
     const ids = sel.has(nodeId) && sel.size > 1 ? [...sel] : [nodeId];
     const origins = {};
@@ -436,7 +557,6 @@ export default function Topology() {
     dragging.current = { ids, startX: e.clientX, startY: e.clientY, origins };
   }, []);
 
-  // Single effect to manage all canvas mouse interaction via the container div
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -449,10 +569,9 @@ export default function Topology() {
 
     const onMouseDown = (e) => {
       if (e.button !== 0 || dragging.current) return;
-      // Defer so React synthetic onMouseDown on nodes can set dragging.current first
       const clientX = e.clientX, clientY = e.clientY;
       requestAnimationFrame(() => {
-        if (dragging.current) return; // node drag won the race
+        if (dragging.current) return;
         const { mode: m } = stateRef.current;
         if (m === 'select') {
           const pt = getSvgPt(clientX, clientY);
@@ -471,6 +590,7 @@ export default function Topology() {
 
     const onMouseMove = (e) => {
       if (dragging.current) {
+        didDrag.current = true;
         const d = dragging.current;
         const z = stateRef.current.zoom;
         const dx = (e.clientX - d.startX) / z;
@@ -499,10 +619,7 @@ export default function Topology() {
     };
 
     const onMouseUp = (e) => {
-      if (dragging.current) {
-        dragging.current = null;
-        return;
-      }
+      if (dragging.current) { dragging.current = null; return; }
       const sr = stateRef.current.selRect;
       if (drawingZone.current && sr) {
         const w = Math.abs(sr.x2 - sr.x1);
@@ -510,10 +627,8 @@ export default function Topology() {
         if (w > 20 && h > 20) {
           const zs = stateRef.current.zones;
           const newZone = {
-            id: `zone-${Date.now()}`,
-            x: Math.min(sr.x1, sr.x2), y: Math.min(sr.y1, sr.y2), w, h,
-            label: 'New Zone',
-            color: ZONE_COLORS[zs.length % ZONE_COLORS.length],
+            id: `zone-${Date.now()}`, x: Math.min(sr.x1, sr.x2), y: Math.min(sr.y1, sr.y2), w, h,
+            label: 'New Zone', color: ZONE_COLORS[zs.length % ZONE_COLORS.length],
           };
           setZones((prev) => [...prev, newZone]);
           userModified.current = true;
@@ -533,11 +648,8 @@ export default function Topology() {
             const p = pos[id];
             if (p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY) inside.add(id);
           }
-          if (e.shiftKey) {
-            setSelectedIds((prev) => new Set([...prev, ...inside]));
-          } else {
-            setSelectedIds(inside);
-          }
+          if (e.shiftKey) setSelectedIds((prev) => new Set([...prev, ...inside]));
+          else setSelectedIds(inside);
         }
         selecting.current = null;
         setSelRect(null);
@@ -556,7 +668,6 @@ export default function Topology() {
     container.addEventListener('mouseup', onMouseUp);
     container.addEventListener('mouseleave', onMouseUp);
     container.addEventListener('wheel', onWheel, { passive: false });
-
     return () => {
       container.removeEventListener('mousedown', onMouseDown);
       container.removeEventListener('mousemove', onMouseMove);
@@ -564,27 +675,26 @@ export default function Topology() {
       container.removeEventListener('mouseleave', onMouseUp);
       container.removeEventListener('wheel', onWheel);
     };
-  }, []); // Empty deps — reads everything from refs
+  }, []);
 
   const handleZoomIn = () => setZoom((z) => Math.min(z + 0.2, 2.5));
   const handleZoomOut = () => setZoom((z) => Math.max(z - 0.2, 0.3));
-  const handleReset = () => { setZoom(1); setPan({ x: 0, y: 0 }); setPositions(initialPositions); setZones([]); api.saveTopologyLayout({ positions: {}, zones: [] }).catch(() => {}); };
+  const handleReset = () => {
+    setZoom(1); setPan({ x: 0, y: 0 }); setPositions(initialPositions); setZones([]);
+    userModified.current = true;
+    api.saveTopologyLayout(viewConfig.key, { positions: {}, zones: [] }).catch(() => {});
+  };
 
-  // Edge counts per node
   const edgeCounts = {};
-  filteredEdges.forEach((e) => {
+  edges.forEach((e) => {
     edgeCounts[e.from] = (edgeCounts[e.from] || 0) + 1;
     edgeCounts[e.to] = (edgeCounts[e.to] || 0) + 1;
   });
 
-  // Stats
-  const bgpCount = edges.filter((e) => e.type === 'bgp').length;
-  const subnetCount = edges.filter((e) => e.type === 'subnet').length;
   const snappedCount = nodes.filter((n) => n.has_snapshot).length;
 
   return (
-    <div className="flex h-[calc(100vh-10rem)] rounded-xl overflow-hidden border border-outline-variant/20" style={{ contain: 'strict' }}>
-      {/* Canvas */}
+    <div className="flex h-full">
       <div ref={containerRef} className="flex-1 relative bg-surface-container-low topology-grid overflow-hidden" style={{ isolation: 'isolate' }}>
         {/* Toolbar */}
         <div className="absolute top-4 left-4 z-20 bg-surface/95 rounded-xl shadow-lg border border-outline-variant/30 flex flex-col gap-0.5 p-1.5">
@@ -593,7 +703,6 @@ export default function Topology() {
           <div className="h-px bg-outline-variant/40 mx-1.5 my-0.5" />
           <ToolbarButton icon="center_focus_strong" onClick={handleReset} label="Reset view" />
           <ToolbarButton icon="label" onClick={() => setShowLabels(!showLabels)} label="Toggle labels" active={showLabels} />
-          <ToolbarButton icon="refresh" onClick={refetch} label="Refresh" />
           <div className="h-px bg-outline-variant/40 mx-1.5 my-0.5" />
           <ToolbarButton icon="arrow_selector_tool" onClick={() => setMode('pointer')} label="Pointer mode" active={mode === 'pointer'} />
           <ToolbarButton icon="select_all" onClick={() => setMode('select')} label="Window select" active={mode === 'select'} />
@@ -603,12 +712,14 @@ export default function Topology() {
         {/* Stats bar */}
         <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 bg-surface/95 rounded-full shadow-md border border-outline-variant/30 px-5 py-2 flex items-center gap-4">
           <div className="flex items-center gap-1.5">
-            <span className="w-2 h-2 rounded-full bg-secondary animate-pulse" />
-            <span className="text-xs font-bold text-on-surface">{nodes.length} Devices</span>
+            <span className="w-2 h-2 rounded-full animate-pulse" style={{ backgroundColor: viewConfig.color }} />
+            <span className="text-xs font-bold text-on-surface">
+              {nodes.filter((n) => !n._isSegment).length} Devices
+              {viewConfig.key === 'l2' ? ` / ${nodes.filter((n) => n._isSegment).length} Segments` : ''}
+            </span>
           </div>
           <span className="text-outline-variant">|</span>
-          <span className="text-[11px] text-on-surface-variant">{bgpCount} BGP</span>
-          <span className="text-[11px] text-on-surface-variant">{subnetCount} Subnet</span>
+          <span className="text-[11px] text-on-surface-variant">{edges.length} Links</span>
           <span className="text-outline-variant">|</span>
           <span className="text-[11px] text-on-surface-variant">{snappedCount}/{nodes.length} Snapped</span>
           {selectedIds.size > 0 && (
@@ -619,35 +730,20 @@ export default function Topology() {
           )}
         </div>
 
-        {/* Filter pills */}
-        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-20 flex gap-1.5 mt-2">
-          {['all', 'bgp', 'subnet'].map((t) => (
-            <button
-              key={t}
-              onClick={() => setFilterType(t)}
-              className={`px-3 py-1 rounded-full text-[11px] font-bold transition-all ${
-                filterType === t
-                  ? 'bg-primary text-on-primary shadow-sm'
-                  : 'bg-surface/95 text-on-surface-variant hover:bg-outline-variant/20 border border-outline-variant/30'
-              }`}
-            >
-              {t === 'all' ? 'All Links' : t === 'bgp' ? 'BGP Only' : 'Subnet Only'}
-            </button>
-          ))}
-        </div>
-
         {/* Legend */}
         <div className="absolute bottom-4 left-4 z-10 bg-surface/95 rounded-xl shadow-lg border border-outline-variant/30 px-4 py-3">
-          <p className="text-[10px] font-bold tracking-widest text-on-surface-variant uppercase mb-2">Legend</p>
+          <p className="text-[10px] font-bold tracking-widest text-on-surface-variant uppercase mb-2">{viewConfig.label} Topology</p>
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center gap-2">
-              <span className="w-5 h-0.5 rounded-full bg-secondary" />
-              <span className="text-[11px] text-on-surface-variant">BGP (solid)</span>
+              <span className="w-5 h-0.5 rounded-full" style={{ backgroundColor: viewConfig.color, borderTop: viewConfig.edgeStyle.dash ? `2px dashed ${viewConfig.color}` : undefined }} />
+              <span className="text-[11px] text-on-surface-variant">{viewConfig.description}</span>
             </div>
-            <div className="flex items-center gap-2">
-              <span className="w-5 h-0.5 rounded-full bg-secondary" style={{ borderTop: '2px dashed #006c4f' }} />
-              <span className="text-[11px] text-on-surface-variant">Subnet (dashed)</span>
-            </div>
+            {viewConfig.key === 'l2' && (
+              <div className="flex items-center gap-2">
+                <span className="inline-block w-5 h-3 rounded border border-outline-variant/60 bg-surface-container-lowest" />
+                <span className="text-[11px] text-on-surface-variant">Subnet segment</span>
+              </div>
+            )}
             <div className="flex items-center gap-2">
               <span className="w-5 h-0.5 rounded-full bg-error" />
               <span className="text-[11px] text-on-surface-variant">Critical</span>
@@ -655,17 +751,7 @@ export default function Topology() {
           </div>
         </div>
 
-        {/* Loading overlay */}
-        {loading && (
-          <div className="absolute inset-0 z-30 flex items-center justify-center bg-surface-container-low/80">
-            <div className="flex flex-col items-center gap-3">
-              <div className="w-8 h-8 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
-              <span className="text-sm font-semibold text-on-surface-variant">Building topology...</span>
-            </div>
-          </div>
-        )}
-
-        {/* SVG canvas */}
+        {/* SVG */}
         <svg
           ref={svgRef}
           className={`absolute inset-0 w-full h-full ${mode === 'select' || mode === 'zone' ? 'cursor-crosshair' : 'cursor-grab active:cursor-grabbing'}`}
@@ -677,20 +763,10 @@ export default function Topology() {
           }}
         >
           <g transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}>
-            {/* Zones (behind everything) */}
+            {/* Zones */}
             {zones.map((zone) => (
               <g key={zone.id}>
-                <rect
-                  x={zone.x}
-                  y={zone.y}
-                  width={zone.w}
-                  height={zone.h}
-                  fill={zone.color.fill}
-                  stroke={zone.color.stroke}
-                  strokeWidth={1.5}
-                  rx={12}
-                />
-                {/* Label */}
+                <rect x={zone.x} y={zone.y} width={zone.w} height={zone.h} fill={zone.color.fill} stroke={zone.color.stroke} strokeWidth={1.5} rx={12} />
                 {editingZone === zone.id ? (
                   <foreignObject x={zone.x} y={zone.y - 2} width={zone.w} height={32}>
                     <input
@@ -704,32 +780,21 @@ export default function Topology() {
                         userModified.current = true;
                         setEditingZone(null);
                       }}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') e.target.blur();
-                        if (e.key === 'Escape') { setEditingZone(null); }
-                      }}
+                      onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); if (e.key === 'Escape') setEditingZone(null); }}
                       onClick={(e) => e.stopPropagation()}
                       onMouseDown={(e) => e.stopPropagation()}
                     />
                   </foreignObject>
                 ) : (
-                  <text
-                    x={zone.x + 12}
-                    y={zone.y + 18}
-                    className="text-[11px] font-bold select-none cursor-pointer"
-                    fill={zone.color.text}
-                    onDoubleClick={(e) => { e.stopPropagation(); setEditingZone(zone.id); }}
-                  >
+                  <text x={zone.x + 12} y={zone.y + 18} className="text-[11px] font-bold select-none cursor-pointer" fill={zone.color.text}
+                    onDoubleClick={(e) => { e.stopPropagation(); setEditingZone(zone.id); }}>
                     {zone.label}
                   </text>
                 )}
-                {/* Delete button */}
                 <foreignObject x={zone.x + zone.w - 24} y={zone.y + 2} width={22} height={22}>
-                  <div
-                    className="w-5 h-5 rounded-full bg-white/80 border border-outline-variant/40 flex items-center justify-center shadow-sm cursor-pointer hover:bg-error/10 hover:border-error/40 transition-colors"
+                  <div className="w-5 h-5 rounded-full bg-white/80 border border-outline-variant/40 flex items-center justify-center shadow-sm cursor-pointer hover:bg-error/10 hover:border-error/40 transition-colors"
                     onClick={(e) => { e.stopPropagation(); setZones((prev) => prev.filter((z) => z.id !== zone.id)); userModified.current = true; }}
-                    onMouseDown={(e) => e.stopPropagation()}
-                  >
+                    onMouseDown={(e) => e.stopPropagation()}>
                     <Icon name="close" className="text-[12px] text-on-surface-variant" />
                   </div>
                 </foreignObject>
@@ -737,37 +802,21 @@ export default function Topology() {
             ))}
 
             {/* Edges */}
-            {filteredEdges.map((edge, i) => {
+            {edges.map((edge, i) => {
               const fromPos = positions[edge.from];
               const toPos = positions[edge.to];
               if (!fromPos || !toPos) return null;
-              return (
-                <EdgeLine
-                  key={i}
-                  edge={edge}
-                  fromPos={fromPos}
-                  toPos={toPos}
-                  showLabels={showLabels}
-                />
-              );
+              return <EdgeLine key={i} edge={edge} fromPos={fromPos} toPos={toPos} showLabels={showLabels} viewConfig={viewConfig} />;
             })}
 
-            {/* Selection / zone-drawing rectangle */}
+            {/* Selection rect */}
             {selRect && (
               <rect
-                x={Math.min(selRect.x1, selRect.x2)}
-                y={Math.min(selRect.y1, selRect.y2)}
-                width={Math.abs(selRect.x2 - selRect.x1)}
-                height={Math.abs(selRect.y2 - selRect.y1)}
-                fill={mode === 'zone'
-                  ? ZONE_COLORS[zones.length % ZONE_COLORS.length].fill
-                  : 'rgba(0, 99, 235, 0.08)'}
-                stroke={mode === 'zone'
-                  ? ZONE_COLORS[zones.length % ZONE_COLORS.length].stroke
-                  : 'rgba(0, 99, 235, 0.4)'}
-                strokeWidth={mode === 'zone' ? 1.5 : 1}
-                strokeDasharray={mode === 'zone' ? undefined : '4 2'}
-                rx={mode === 'zone' ? 12 : 4}
+                x={Math.min(selRect.x1, selRect.x2)} y={Math.min(selRect.y1, selRect.y2)}
+                width={Math.abs(selRect.x2 - selRect.x1)} height={Math.abs(selRect.y2 - selRect.y1)}
+                fill={mode === 'zone' ? ZONE_COLORS[zones.length % ZONE_COLORS.length].fill : 'rgba(0, 99, 235, 0.08)'}
+                stroke={mode === 'zone' ? ZONE_COLORS[zones.length % ZONE_COLORS.length].stroke : 'rgba(0, 99, 235, 0.4)'}
+                strokeWidth={mode === 'zone' ? 1.5 : 1} strokeDasharray={mode === 'zone' ? undefined : '4 2'} rx={mode === 'zone' ? 12 : 4}
               />
             )}
 
@@ -775,25 +824,20 @@ export default function Topology() {
             {nodes.map((node) => {
               const pos = positions[node.id];
               if (!pos) return null;
+              const NodeComponent = node._isSegment ? SegmentNode : DeviceNode;
               return (
-                <DeviceNode
-                  key={node.id}
-                  node={node}
-                  pos={pos}
+                <NodeComponent
+                  key={node.id} node={node} pos={pos}
                   selected={selectedNode?.id === node.id || selectedIds.has(node.id)}
                   onClick={(n, e) => {
+                    if (didDrag.current) return;
                     if (e.ctrlKey || e.metaKey) {
-                      setSelectedIds((prev) => {
-                        const next = new Set(prev);
-                        next.has(n.id) ? next.delete(n.id) : next.add(n.id);
-                        return next;
-                      });
+                      setSelectedIds((prev) => { const next = new Set(prev); next.has(n.id) ? next.delete(n.id) : next.add(n.id); return next; });
                     } else {
                       setSelectedIds(new Set());
                       setSelectedNode(n);
                     }
                   }}
-                  edgeCount={edgeCounts[node.id] || 0}
                   onDragStart={handleNodeDragStart}
                 />
               );
@@ -804,13 +848,123 @@ export default function Topology() {
 
       {/* Detail panel */}
       {selectedNode && (
-        <DetailPanel
-          node={selectedNode}
-          edges={edges}
-          allNodes={nodes}
-          onClose={() => setSelectedNode(null)}
-        />
+        selectedNode._isSegment
+          ? <SegmentDetailPanel node={selectedNode} edges={edges} allNodes={nodes} onClose={() => setSelectedNode(null)} />
+          : <DetailPanel node={selectedNode} edges={edges} allNodes={nodes} onClose={() => setSelectedNode(null)} viewConfig={viewConfig} />
       )}
+    </div>
+  );
+}
+
+// ── Main component ──────────────────────────────────────────
+
+export default function Topology() {
+  const { data: topologyData, loading, refetch } = useApi(api.topology);
+  const [activeView, setActiveView] = useState('bgp');
+
+  const baseNodes = topologyData?.nodes || [];
+
+  // Transform L2 segments into virtual hub nodes + spoke edges
+  const l2Data = useMemo(() => {
+    const segments = topologyData?.l2_segments || [];
+    const segNodes = [];
+    const segEdges = [];
+    for (const seg of segments) {
+      segNodes.push({
+        id: seg.id,
+        hostname: seg.subnet,
+        device_type: 'segment',
+        has_snapshot: true,
+        interfaces_up: seg.members.length,
+        interfaces_total: seg.members.length,
+        _isSegment: true,
+        _memberCount: seg.members.length,
+        _members: seg.members,
+        tags: {},
+      });
+      for (const m of seg.members) {
+        segEdges.push({
+          from: m.device_id,
+          to: seg.id,
+          type: 'l2',
+          health: 'optimal',
+          label: m.ip,
+          from_intf: m.intf,
+          to_intf: '',
+          mac: m.mac || '',
+        });
+      }
+    }
+    return { nodes: segNodes, edges: segEdges };
+  }, [topologyData]);
+
+  const nodesByView = useMemo(() => ({
+    bgp: baseNodes,
+    l2: [...baseNodes, ...l2Data.nodes],
+  }), [baseNodes, l2Data]);
+
+  const edgesByView = useMemo(() => ({
+    bgp: topologyData?.bgp_edges || [],
+    l2: l2Data.edges,
+  }), [topologyData, l2Data]);
+
+  const viewConfig = VIEWS[activeView];
+  const currentNodes = nodesByView[activeView];
+  const currentEdges = edgesByView[activeView];
+
+  return (
+    <div className="flex flex-col h-[calc(100vh-10rem)]">
+      {/* View tabs */}
+      <div className="flex items-center gap-1 mb-3">
+        {Object.values(VIEWS).map((v) => {
+          const count = v.key === 'l2' ? l2Data.nodes.length : (edgesByView[v.key]?.length || 0);
+          const isActive = activeView === v.key;
+          return (
+            <button
+              key={v.key}
+              onClick={() => setActiveView(v.key)}
+              className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold transition-all ${
+                isActive
+                  ? 'bg-surface-container-lowest shadow-md border border-outline-variant/30 text-on-surface'
+                  : 'text-on-surface-variant hover:bg-surface-container-high/60'
+              }`}
+            >
+              <Icon name={v.icon} className="text-lg" style={isActive ? { color: v.color } : undefined} />
+              <span>{v.label}</span>
+              <span className={`ml-1 px-2 py-0.5 rounded-full text-[10px] font-extrabold ${
+                isActive ? 'text-white' : 'bg-outline-variant/20 text-on-surface-variant'
+              }`} style={isActive ? { backgroundColor: v.color } : undefined}>
+                {count}
+              </span>
+            </button>
+          );
+        })}
+        <div className="flex-1" />
+        <button onClick={refetch} className="p-2 rounded-lg hover:bg-surface-container-high transition-colors" title="Refresh topology">
+          <Icon name="refresh" className="text-lg text-on-surface-variant" />
+        </button>
+      </div>
+
+      {/* Canvas */}
+      <div className="flex-1 rounded-xl overflow-hidden border border-outline-variant/20" style={{ contain: 'strict' }}>
+        {loading && (
+          <div className="flex items-center justify-center h-full bg-surface-container-low">
+            <div className="flex flex-col items-center gap-3">
+              <div className="w-8 h-8 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
+              <span className="text-sm font-semibold text-on-surface-variant">Building topology...</span>
+            </div>
+          </div>
+        )}
+        {!loading && (
+          <TopologyCanvas
+            key={activeView}
+            nodes={currentNodes}
+            edges={currentEdges}
+            viewConfig={viewConfig}
+            active={true}
+          />
+        )}
+      </div>
     </div>
   );
 }

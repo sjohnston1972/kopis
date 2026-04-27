@@ -47,6 +47,7 @@ class Settings(BaseSettings):
 
     # ── Application ──────────────────────────────────────────
     snapshot_schedule_cron: str = "0 */6 * * *"
+    inventory_refresh_minutes: int = 60
     approval_expiry_hours: int = 24
     log_level: str = "INFO"
 

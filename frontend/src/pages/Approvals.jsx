@@ -1,5 +1,6 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useApi } from '../hooks/useApi';
+import { usePipelineEvents } from '../hooks/usePipelineEvents';
 import { api } from '../api/client';
 import Icon from '../components/Icon';
 import StatusChip from '../components/StatusChip';
@@ -79,6 +80,32 @@ function ApprovalCard({ approval, onApprove, onDeny }) {
             <StatusChip variant={severityVariant(finding.severity)}>
               {(finding.severity || 'UNKNOWN').toUpperCase()}
             </StatusChip>
+            {finding.agent_model && (
+              <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wide ${
+                finding.agent_model.toLowerCase().includes('opus')
+                  ? 'bg-purple-500/15 text-purple-400 ring-1 ring-purple-500/30'
+                  : finding.agent_model.toLowerCase().includes('sonnet')
+                    ? 'bg-blue-500/15 text-blue-400 ring-1 ring-blue-500/30'
+                    : finding.agent_model.toLowerCase().includes('haiku')
+                      ? 'bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/30'
+                      : 'bg-surface-container-high text-on-surface-variant'
+              }`}>
+                {finding.agent_model} — analysis
+              </span>
+            )}
+            {recommendation.agent_model && (
+              <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wide ${
+                recommendation.agent_model.toLowerCase().includes('opus')
+                  ? 'bg-purple-500/15 text-purple-400 ring-1 ring-purple-500/30'
+                  : recommendation.agent_model.toLowerCase().includes('sonnet')
+                    ? 'bg-blue-500/15 text-blue-400 ring-1 ring-blue-500/30'
+                    : recommendation.agent_model.toLowerCase().includes('haiku')
+                      ? 'bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/30'
+                      : 'bg-surface-container-high text-on-surface-variant'
+              }`}>
+                {recommendation.agent_model} — remediation
+              </span>
+            )}
           </div>
           <h3 className="text-lg font-bold text-on-surface leading-tight">
             {finding.title || 'Untitled Finding'}
@@ -252,6 +279,7 @@ function ApprovalCard({ approval, onApprove, onDeny }) {
 
 export default function Approvals() {
   const { data: approvals, loading, error, refetch } = useApi(() => api.approvals());
+  usePipelineEvents(useCallback(() => refetch(), [refetch]));
   const [expiring, setExpiring] = useState(false);
   const pollRef = useRef(null);
 
