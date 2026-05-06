@@ -31,7 +31,6 @@ def start() -> None:
         _refresh_inventory_job,
         trigger=IntervalTrigger(minutes=settings.inventory_refresh_minutes),
         id="inventory_refresh",
-        next_run_time=None,
         max_instances=1,
         coalesce=True,
     )

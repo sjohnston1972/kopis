@@ -147,7 +147,7 @@ function LastSnapshotCard({ status, onTrigger, onClear }) {
               <span className="text-[10px] font-extrabold uppercase tracking-widest text-on-surface-variant">
                 Features per device
               </span>
-              <div className="flex-1 min-h-0 space-y-1 overflow-y-auto pr-1">
+              <div className={`flex-1 min-h-0 space-y-1 overflow-y-auto pr-1${status.per_device.length >= 13 ? ' max-h-[360px]' : ''}`}>
                 {status.per_device.map((d) => (
                   <div key={d.hostname} className="flex items-center justify-between bg-surface-container-low rounded-lg px-3 py-1.5">
                     <span className="text-[11px] font-bold text-on-surface">{d.hostname}</span>
@@ -293,6 +293,14 @@ export default function Dashboard() {
   const findingCounts = m.findings || {};
   const criticalCount = (findingCounts.critical || 0) + (findingCounts.high || 0);
   const warningCount = findingCounts.medium || 0;
+  const totalFindings = ['critical', 'high', 'medium', 'low', 'info']
+    .reduce((sum, k) => sum + (findingCounts[k] || 0), 0);
+  const anomalyFree = totalFindings === 0;
+  const heroColor = criticalCount > 0
+    ? 'text-error'
+    : warningCount > 0
+    ? 'text-tertiary'
+    : 'text-secondary';
 
   // Service health
   const deps = healthDeps?.dependencies || {};
@@ -349,19 +357,15 @@ export default function Dashboard() {
 
             <div className="relative z-10 flex flex-col gap-6">
               <div className="flex items-baseline gap-4">
-                {connectivityPct !== null ? (
-                  <span className={`text-7xl font-bold leading-none ${
-                    connectivityPct >= 95 ? 'text-secondary' : connectivityPct >= 80 ? 'text-tertiary' : 'text-error'
-                  }`}>
-                    {loading ? '--' : `${connectivityPct}%`}
+                <span className={`text-7xl font-bold leading-none ${loading ? 'text-on-surface-variant/30' : anomalyFree ? 'text-secondary' : heroColor}`}>
+                  {loading ? '--' : anomalyFree ? '100%' : totalFindings}
+                </span>
+                {!loading && (
+                  <span className="text-lg font-bold text-on-surface whitespace-nowrap">
+                    {anomalyFree
+                      ? 'Anomaly Free'
+                      : `Issue${totalFindings === 1 ? '' : 's'} Detected`}
                   </span>
-                ) : (
-                  <span className="text-7xl font-bold leading-none text-on-surface-variant/30">
-                    {loading ? '--' : 'N/A'}
-                  </span>
-                )}
-                {connectivityPct === 100 && !loading && (
-                  <span className="text-lg font-bold text-on-surface whitespace-nowrap">Anomaly Free</span>
                 )}
               </div>
 
@@ -415,21 +419,21 @@ export default function Dashboard() {
             <MetricCard
               icon="alt_route"
               label="Routes"
-              value={totalRoutes}
+              value={totalRoutes.toLocaleString()}
               sub={
                 totalRoutes === 0
                   ? 'No routes learned'
-                  : `of ${totalRoutes.toLocaleString()} total (${totalDevices > 0 ? Math.round(snappedDevices / totalDevices * 100) : 0}%)`
+                  : `across ${snappedDevices}/${totalDevices} devices`
               }
             />
             <MetricCard
               icon="dns"
               label="ARP Entries"
-              value={totalArp}
+              value={totalArp.toLocaleString()}
               sub={
                 totalArp === 0
                   ? 'No ARP data'
-                  : `of ${totalArp.toLocaleString()} total (${totalDevices > 0 ? Math.round(snappedDevices / totalDevices * 100) : 0}%)`
+                  : `across ${snappedDevices}/${totalDevices} devices`
               }
             />
             <MetricCard
