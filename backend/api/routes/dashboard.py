@@ -151,12 +151,35 @@ async def dashboard_metrics(db: AsyncSession = Depends(get_db)):
 
         device_summaries.append(summary)
 
-    # Recent findings count by severity
-    result = await db.execute(
-        select(Finding.severity, func.count(Finding.id))
-        .group_by(Finding.severity)
+    # Active findings only — same staleness filter as /findings/incidents/list.
+    # A finding whose snapshot_id is not the device's latest successful
+    # snapshot represents a symptom that was NOT re-detected — i.e. resolved.
+    # Counting those would make the Network Health tile lie about a fix the
+    # operator already applied.
+    latest_sq2 = (
+        select(Snapshot.device_id, func.max(Snapshot.created_at).label("max_ts"))
+        .where(func.array_length(Snapshot.features_learned, 1) > 0)
+        .group_by(Snapshot.device_id)
+        .subquery()
     )
-    finding_counts = {row[0]: row[1] for row in result.all()}
+    latest_snap_q = await db.execute(
+        select(Snapshot.id, Snapshot.device_id)
+        .join(
+            latest_sq2,
+            (Snapshot.device_id == latest_sq2.c.device_id)
+            & (Snapshot.created_at == latest_sq2.c.max_ts),
+        )
+    )
+    latest_ids = {row[1]: row[0] for row in latest_snap_q.all()}
+
+    all_findings_q = await db.execute(
+        select(Finding.severity, Finding.device_id, Finding.snapshot_id)
+    )
+    finding_counts: dict[str, int] = {}
+    for sev, dev_id, snap_id in all_findings_q.all():
+        if latest_ids.get(dev_id) != snap_id:
+            continue  # stale — issue resolved
+        finding_counts[sev] = finding_counts.get(sev, 0) + 1
 
     return {
         "devices": {
