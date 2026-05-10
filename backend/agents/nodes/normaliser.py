@@ -1,90 +1,26 @@
-"""Normaliser node — Ollama-powered data reduction.
+"""Normaliser node — deterministic data reduction.
 
-Tier 0 (local, free). Takes raw pyATS snapshot JSON and extracts a
-compact structured summary: interface states, routing neighbours,
-error counters, version info, and quick anomaly flags.
+Tier 0 of the pipeline. Takes raw pyATS snapshot JSON and extracts a
+compact structured summary: interface states, routing neighbours, error
+counters, version info, and quick anomaly flags.
 
-This is a DATA REDUCTION step — fast and cheap. Analysis happens later.
+This used to call Ollama (qwen2.5) but Ollama on the homelab proved too
+unreliable: 30s timeouts × 18 devices = ~9 min wasted per snapshot, and
+the model often returned malformed JSON anyway. The deterministic
+extractor below catches everything that mattered, runs in milliseconds,
+and never fails. Haiku (Tier 1) does the actual anomaly analysis — the
+normaliser just feeds it tidy data.
+
+The Ollama integration is preserved (`integrations/ollama.py`) for future
+use — e.g. if a small focused prompt becomes worthwhile, or for chat.
 """
-
-import json
-import uuid
 
 import structlog
 
 from agents.state import KopisState
-from integrations.ollama import ollama_client
 from services.activity import activity_bus
 
 log = structlog.get_logger()
-
-SYSTEM_PROMPT = """\
-You are a network data normaliser. You receive raw pyATS learned data from a
-network device and produce a compact JSON summary.
-
-Your job is DATA REDUCTION, not analysis. Be fast and factual.
-
-Output MUST be valid JSON with exactly these top-level keys:
-{
-  "interface_summary": [
-    {
-      "name": "GigabitEthernet0/1",
-      "status": "up|down|admin-down",
-      "ip_address": "x.x.x.x/mask or null",
-      "speed": "1Gbps",
-      "in_errors": 0,
-      "out_errors": 0,
-      "in_crc": 0,
-      "description": "string or null"
-    }
-  ],
-  "routing_summary": [
-    {
-      "protocol": "ospf|bgp|static|connected",
-      "neighbours": [{"id": "x.x.x.x", "state": "FULL|ESTABLISHED|etc"}],
-      "route_count": 0,
-      "areas": ["0.0.0.0"]
-    }
-  ],
-  "platform": {
-    "hostname": "string",
-    "os": "string",
-    "version": "string",
-    "uptime": "string",
-    "serial": "string or null"
-  },
-  "anomalies_detected": [
-    {
-      "type": "interface_down|high_errors|missing_neighbour|version_mismatch|other",
-      "entity": "affected interface or protocol",
-      "detail": "brief description"
-    }
-  ]
-}
-
-Rules:
-- Only include interfaces that are configured (skip unassigned/unused).
-- Flag interfaces with >100 errors as anomalies.
-- Flag routing neighbours not in FULL/ESTABLISHED state.
-- Flag interfaces that are operationally down but admin-up.
-- Keep output compact. Do not include raw counters beyond what is specified.
-
-If a DIFF section is provided, it shows what changed since the last snapshot.
-Only flag changes that indicate a real problem or meaningful state transition:
-- ARP entries that were REMOVED (neighbour went away)
-- BGP session state changing AWAY from Established (session drop)
-- Interface oper_status changing from up to down
-- Routing entries being REMOVED (path withdrawal)
-
-Do NOT flag as anomalies:
-- Counter increments (packets, octets, errors going from e.g. 5 to 7)
-- Timer updates (keepalives, dead timers, hello timers)
-- Uptime or timestamp changes
-- Normal routing metric recalculations
-- ARP entries being ADDED (new neighbour is good)
-- Routes being ADDED (more reachability is good)
-- Any change that is part of normal protocol operation
-"""
 
 
 def _fallback_normalise(raw: dict, hostname: str, platform: str, diff: dict | None = None) -> dict:
@@ -264,6 +200,17 @@ def _fallback_normalise(raw: dict, hostname: str, platform: str, diff: dict | No
                         "detail": f"Interface went down (was {change.get('old')})",
                     })
 
+            # Interface admin-disabled (someone ran 'shutdown') — this is
+            # the cascade-causing change, not background noise.
+            elif "interface" in key and key.endswith(".enabled") and status == "changed":
+                if change.get("old") is True and change.get("new") is False:
+                    intf_name = key.split(".")[1] if "." in key else key
+                    anomalies.append({
+                        "type": "state_change",
+                        "entity": intf_name,
+                        "detail": f"Interface {intf_name} was shut down (admin-disabled) — was previously enabled",
+                    })
+
     return {
         "interface_summary": interface_summary,
         "routing_summary": routing_summary,
@@ -273,75 +220,27 @@ def _fallback_normalise(raw: dict, hostname: str, platform: str, diff: dict | No
 
 
 async def normaliser_node(state: KopisState) -> dict:
-    """LangGraph node: normalise raw snapshot data via Ollama."""
+    """LangGraph node: deterministic data reduction.
+
+    Runs in milliseconds — no LLM call. Output feeds into the Haiku
+    topology agent which does the actual anomaly analysis.
+    """
     hostname = state.get("device_hostname", "unknown")
     raw = state.get("raw_snapshot", {})
+    platform = state.get("device_platform", "unknown")
 
-    log.info("normaliser_start", hostname=hostname)
     act_id = activity_bus.start(
         pipeline_run=state.get("snapshot_id", ""),
         node="normaliser",
-        model=ollama_client.model,
+        model="deterministic",
         device=hostname,
-        detail=f"Ollama extracting key facts from {hostname} snapshot",
+        detail=f"Extracting key facts from {hostname} snapshot",
     )
 
-    # Truncate large snapshots to fit context window
-    raw_str = json.dumps(raw, default=str)
-    if len(raw_str) > 60_000:
-        raw_str = raw_str[:60_000] + "\n... [TRUNCATED]"
-
-    # Include diff data if available
-    diff = state.get("snapshot_diff", {})
-    diff_section = ""
-    if diff and not diff.get("note"):
-        diff_str = json.dumps(diff, default=str)
-        if len(diff_str) > 20_000:
-            diff_str = diff_str[:20_000] + "\n... [TRUNCATED]"
-        diff_section = f"\n\n## DIFF (changes since last snapshot):\n{diff_str}"
-
-    prompt = f"Device hostname: {hostname}\nPlatform: {state.get('device_platform', 'unknown')}\n\nRaw pyATS data:\n{raw_str}{diff_section}"
-
-    try:
-        result = await ollama_client.generate(
-            prompt=prompt,
-            system=SYSTEM_PROMPT,
-            temperature=0.05,
-        )
-    except Exception as e:
-        log.warning("normaliser_ollama_failed_using_fallback", hostname=hostname, error=str(e))
-        activity_bus.thinking(act_id, f"Ollama unavailable — using deterministic fallback for {hostname}")
-        fallback = _fallback_normalise(raw, hostname, state.get("device_platform", "unknown"), state.get("snapshot_diff"))
-        activity_bus.complete(act_id, detail=f"Fallback normaliser: {len(fallback.get('anomalies_detected', []))} anomalies on {hostname}")
-        return {
-            "normalised_data": fallback,
-            "interface_summary": fallback.get("interface_summary", []),
-            "routing_summary": fallback.get("routing_summary", []),
-            "anomalies_detected": fallback.get("anomalies_detected", []),
-            "processing_stage": "topology",
-            "errors": state.get("errors", []) + [f"Normaliser failed: {e} (used fallback)"],
-            "tokens_used": state.get("tokens_used", {}),
-        }
-
-    tokens = result.pop("_tokens", 0)
-    token_tracking = state.get("tokens_used", {})
-    token_tracking["ollama"] = token_tracking.get("ollama", 0) + tokens
-
-    if result.get("_parse_error"):
-        log.warning("normaliser_parse_error", hostname=hostname)
-        activity_bus.fail(act_id, f"Ollama returned invalid JSON for {hostname}")
-        return {
-            "normalised_data": {},
-            "interface_summary": [],
-            "routing_summary": [],
-            "anomalies_detected": [],
-            "processing_stage": "normalise",
-            "errors": state.get("errors", []) + ["Normaliser returned invalid JSON"],
-            "tokens_used": token_tracking,
-        }
-
+    result = _fallback_normalise(raw, hostname, platform, state.get("snapshot_diff"))
     anomaly_count = len(result.get("anomalies_detected", []))
-    activity_bus.complete(act_id, tokens=tokens, detail=f"Ollama normalised {hostname}: {anomaly_count} anomalies flagged")
+
+    activity_bus.complete(act_id, detail=f"Normalised {hostname}: {anomaly_count} anomalies flagged")
     log.info(
         "normaliser_complete",
         hostname=hostname,
@@ -355,5 +254,5 @@ async def normaliser_node(state: KopisState) -> dict:
         "routing_summary": result.get("routing_summary", []),
         "anomalies_detected": result.get("anomalies_detected", []),
         "processing_stage": "topology",
-        "tokens_used": token_tracking,
+        "tokens_used": state.get("tokens_used", {}),
     }

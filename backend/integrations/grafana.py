@@ -6,6 +6,8 @@ InfluxDB backends — the homelab uses Telegraf → InfluxDB with
 'cisco' and 'fortinet' measurements.
 """
 
+from datetime import datetime, timezone
+
 import structlog
 import httpx
 from urllib.parse import quote
@@ -109,6 +111,11 @@ class GrafanaClient:
                         device_tags["site"] = site
                     device_tags["measurement"] = measurement
 
+                    # last_seen is the timestamp of the most recent telemetry point
+                    # for this device — proves Telegraf actually saw it, not just that
+                    # the inventory list was synced.
+                    last_seen = _extract_last_timestamp(series)
+
                     devices.append({
                         "hostname": hostname,
                         "management_ip": agent_host or hostname,
@@ -116,6 +123,7 @@ class GrafanaClient:
                         "device_type": device_type,
                         "grafana_source": f"influxdb/snmp/{measurement}",
                         "tags": device_tags,
+                        "last_seen": last_seen,
                     })
 
         log.info(
@@ -188,6 +196,32 @@ class GrafanaClient:
 
         log.info("grafana_discover_complete", device_count=len(devices))
         return devices
+
+
+def _extract_last_timestamp(series: dict) -> datetime | None:
+    """Pull the most recent timestamp from an InfluxQL series response.
+
+    The 'time' column may be ISO8601 (default) or epoch ms (when Grafana
+    sends epoch=ms). Returns None if it can't be parsed.
+    """
+    columns = series.get("columns") or []
+    values = series.get("values") or []
+    if not columns or not values:
+        return None
+    try:
+        time_idx = columns.index("time")
+    except ValueError:
+        return None
+    raw = values[-1][time_idx]
+    if isinstance(raw, (int, float)):
+        return datetime.fromtimestamp(raw / 1000, tz=timezone.utc)
+    if isinstance(raw, str):
+        # Influx returns "2026-05-10T07:30:00Z"
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
 
 
 grafana_client = GrafanaClient()

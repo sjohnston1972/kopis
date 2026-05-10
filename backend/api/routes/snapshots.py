@@ -152,8 +152,21 @@ async def _run_snapshot_background(
             if successful_snapshots:
                 log.info("pipeline_auto_trigger", count=len(successful_snapshots))
                 from agents.graph import run_pipeline
+                from services.correlation import (
+                    apply_correlation,
+                    create_incident_approvals,
+                    generate_incident_remediations,
+                )
 
                 from services.snapshot_engine import get_snapshot_diff
+
+                # In multi-device mode, defer BOTH per-device Sonnet remediation
+                # AND approval/Jira/Slack so the correlation step can collapse
+                # cascade duplicates into one incident first. Then we run a
+                # single Sonnet call per incident root, and a single approval
+                # per incident — instead of N copies of each.
+                multi_device = len(successful_snapshots) > 1
+                completed_snapshot_ids: list[str] = []
 
                 for snap in successful_snapshots:
                     try:
@@ -177,12 +190,26 @@ async def _run_snapshot_background(
                             device_platform=platform,
                             raw_snapshot=snap.snapshot_data,
                             snapshot_diff=snapshot_diff,
+                            create_approvals=not multi_device,
+                            defer_remediation=multi_device,
                         )
+                        completed_snapshot_ids.append(snap.id)
                         log.info("pipeline_auto_complete", hostname=hostname)
                     except Exception as pipe_err:
                         log.error("pipeline_auto_failed",
                                   hostname=dev_map.get(snap.device_id, snap.device_id[:8]),
                                   error=str(pipe_err))
+
+                # Cross-device correlation → per-incident Sonnet → per-incident
+                # approval/Jira. Skipped for single-device runs (no cascade).
+                if multi_device and completed_snapshot_ids:
+                    try:
+                        incidents = await apply_correlation(db, completed_snapshot_ids)
+                        await generate_incident_remediations(db, incidents)
+                        await create_incident_approvals(db, incidents)
+                        await db.commit()
+                    except Exception as corr_err:
+                        log.error("correlation_failed", error=str(corr_err))
         except Exception as e:
             log.error("background_snapshot_failed", error=str(e))
             await _write_status(db, {
@@ -231,6 +258,29 @@ async def clear_snapshot_status(db: AsyncSession = Depends(get_db)):
     return {"cleared": True}
 
 
+async def _wait_then_run_snapshot(device_id: str | None) -> None:
+    """Wait for any in-progress snapshot to finish, then run this one.
+
+    Replaces the old 409-Conflict-on-busy behaviour. Manual or scheduled
+    snapshot requests are now queued (well, serialised — no real queue is
+    needed since most callers only stack 1 deep) instead of dropped.
+    """
+    poll_interval = 5
+    max_wait = 1800  # 30 min hard cap
+    waited = 0
+    while waited < max_wait:
+        async with async_session() as db:
+            status = await _read_status(db)
+        if not status.get("running"):
+            break
+        await asyncio.sleep(poll_interval)
+        waited += poll_interval
+    if waited >= max_wait:
+        log.warning("queued_snapshot_abandoned", device_id=device_id, waited=waited)
+        return
+    await _run_snapshot_background(device_id)
+
+
 @router.post("", response_model=list[SnapshotRead])
 async def trigger_snapshot(
     body: SnapshotTrigger | None = None,
@@ -238,12 +288,15 @@ async def trigger_snapshot(
 ):
     device_id = body.device_id if body else None
 
-    # Check if one is already running
+    # If one is already running, queue ours behind it (no 409). Polls every
+    # 5s until the in-progress run finishes, then starts the new one. The
+    # response returns immediately either way.
     status = await _read_status(db)
     if status.get("running"):
-        raise HTTPException(status_code=409, detail="Snapshot already in progress")
+        log.info("snapshot_queued", device_id=device_id, current_device=status.get("current_device"))
+        asyncio.create_task(_wait_then_run_snapshot(device_id))
+        return []
 
-    # Launch in background so the response returns immediately
     asyncio.create_task(_run_snapshot_background(device_id))
     return []
 

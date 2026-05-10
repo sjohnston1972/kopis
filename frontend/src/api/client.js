@@ -72,6 +72,8 @@ export const api = {
   finding: (id) => request(`/findings/${id}`),
   dismissFinding: (id) => request(`/findings/${id}`, { method: 'DELETE' }),
   escalateFinding: (id) => request(`/findings/${id}/escalate`, { method: 'POST' }),
+  incidents: () => request('/findings/incidents/list'),
+  recorrelateIncidents: () => request('/findings/incidents/recorrelate', { method: 'POST' }),
 
   // Approvals
   approvals: () => request('/approvals'),

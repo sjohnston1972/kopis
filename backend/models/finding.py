@@ -19,6 +19,9 @@ class FindingRead(BaseModel):
     requires_remediation: bool
     agent_model: str | None = None
     tokens_used: int | None = None
+    incident_id: str | None = None
+    is_root_cause: bool = False
+    correlation_reason: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

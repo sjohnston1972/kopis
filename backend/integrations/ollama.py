@@ -46,7 +46,11 @@ class OllamaClient:
         if format:
             payload["format"] = format
 
-        async with httpx.AsyncClient(timeout=120) as client:
+        # Aggressive 30s timeout: this is Tier 0 (fast triage). If the local
+        # model doesn't respond inside that window the deterministic fallback
+        # in normaliser_node takes over — far better than blocking the whole
+        # snapshot pipeline waiting on a slow local model.
+        async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(f"{self.base_url}/api/generate", json=payload)
             r.raise_for_status()
 

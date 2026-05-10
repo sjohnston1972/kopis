@@ -75,6 +75,11 @@ async def lifespan(app: FastAPI):
     log.info("kopis_starting")
     await _reset_stale_snapshot_status()
     await _reset_orphaned_approvals()
+    # Refresh inventory immediately on startup so devices have fresh
+    # last_seen/last_refreshed timestamps the moment the API comes up.
+    # Don't rely on the scheduler's first fire — if APScheduler has any
+    # hiccup, we'd otherwise stay stale until someone clicks refresh.
+    await scheduler.refresh_inventory_now()
     scheduler.start()
     await scheduler.load_persistent_schedules()
     yield

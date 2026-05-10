@@ -53,6 +53,11 @@ class KopisState(TypedDict, total=False):
     # ── Control flow ─────────────────────────────────────────
     escalate_to_opus: bool
     force_escalation: bool  # Set by manual escalation — always routes to Opus
+    # When True (multi-device snapshot runs), the per-device pipeline stops
+    # after topology. Remediation is generated once per *incident* by the
+    # snapshot route after correlation, instead of once per device — saves
+    # N-1 Sonnet calls when one event affects N devices.
+    defer_remediation: bool
     processing_stage: Literal[
         "normalise", "topology", "remediation", "escalation", "complete"
     ]

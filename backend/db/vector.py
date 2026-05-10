@@ -61,7 +61,13 @@ def find_similar(
     """Search for semantically similar findings on the same device.
 
     Returns matches with distance < threshold (cosine).
-    Lower distance = more similar.  0.15 is a tight match for near-duplicates.
+    Lower distance = more similar. 0.15 is a tight match for near-duplicates.
+
+    Filters: same device_id (always), same affected_entity (when provided)
+    so we don't accidentally dedupe two distinct issues just because their
+    titles read similarly. e.g. 'BGP neighbor 192.168.1.1 down' and
+    'BGP neighbor 192.168.1.5 down' are DIFFERENT incidents — same device,
+    same general problem class, different peers.
     """
     try:
         collection = _get_collection()
@@ -69,10 +75,20 @@ def find_similar(
             return []
 
         doc = f"{title}\n{description}\nEntity: {affected_entity}"
+        # Chroma's $and expects multiple sub-conditions. Skip the entity
+        # filter if affected_entity is empty.
+        if affected_entity:
+            where = {"$and": [
+                {"device_id": device_id},
+                {"affected_entity": affected_entity},
+            ]}
+        else:
+            where = {"device_id": device_id}
+
         results = collection.query(
             query_texts=[doc],
             n_results=5,
-            where={"device_id": device_id},
+            where=where,
         )
 
         matches = []

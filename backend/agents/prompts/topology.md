@@ -24,7 +24,7 @@ open a ticket? If not, it's not a finding.
 ## What is NOT a finding
 
 - Normal counter increments between snapshots (packets transmitted, octets, keepalives)
-- Interfaces that are admin-down (intentionally disabled — this is expected)
+- Interfaces that are admin-down with no recent state change (intentionally disabled and stable — this is expected)
 - Routing metrics being recalculated or updated
 - ARP/MAC table entries being added (new reachability is normal)
 - Routes being added (more paths is normal)
@@ -34,6 +34,12 @@ open a ticket? If not, it's not a finding.
 - Version information, platform details, serial numbers (these are inventory data, not findings)
 - Features functioning normally (OSPF adjacency is FULL — that's good, not a finding)
 - Interfaces that are up and working correctly
+
+## Important nuance: admin-down interfaces
+
+An interface that is admin-down AND has been for a long time (no recent change) is intentional — not a finding.
+
+But an interface that **just transitioned to admin-down** (visible in the diff: `enabled: true → false`, or `oper_status: up → down` with admin_state changing) **IS a finding requiring remediation** — someone (or something) shut it down recently, and if that interface carries production traffic (has an IP, is part of a routing protocol, has BGP/OSPF neighbours on it), the cascade you see in routing and ARP findings is the consequence. Mark `requires_remediation: true` for that case — the human approver decides whether to bring it back up. Severity: critical if the interface had active routing adjacencies, high otherwise.
 
 **If the device is healthy and operating normally, return ZERO findings.** An empty
 findings list is a perfectly valid (and expected) result for a healthy device.

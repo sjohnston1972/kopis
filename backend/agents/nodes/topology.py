@@ -19,8 +19,47 @@ log = structlog.get_logger()
 SYSTEM_PROMPT = (Path(__file__).parent.parent / "prompts" / "topology.md").read_text()
 
 
+def _diff_has_meaningful_change(diff: dict) -> bool:
+    """True if the diff contains a state change worth analysing.
+
+    The normaliser already filters timer/counter noise into anomalies. Here
+    we look at the *raw* diff to decide whether the topology agent has any
+    real work to do. Any of the following counts as meaningful:
+      - interface oper_status changing
+      - BGP/OSPF session state changing
+      - routing entries removed (path withdrawn)
+      - ARP entries removed (peer went away)
+    Pure additions (new ARP, new routes) are NORMAL and don't warrant a
+    Haiku call on their own.
+    """
+    if not isinstance(diff, dict) or diff.get("note"):
+        return False
+    for key, change in diff.items():
+        if not isinstance(change, dict):
+            continue
+        status = change.get("status", "")
+        klow = key.lower()
+        if status == "removed" and ("arp" in klow or "routing" in klow or "neighbor" in klow):
+            return True
+        if status == "changed":
+            if "oper_status" in klow and change.get("new") == "down":
+                return True
+            if "session_state" in klow and change.get("old") == "Established" and change.get("new") != "Established":
+                return True
+            if "enabled" in klow and change.get("new") is False:
+                return True
+    return False
+
+
 async def topology_node(state: KopisState) -> dict:
-    """LangGraph node: classify findings from normalised data via Haiku."""
+    """LangGraph node: classify findings from normalised data via Haiku.
+
+    Token-saving short-circuit: if the normaliser flagged zero anomalies AND
+    the diff contains nothing meaningful (or doesn't exist), the device is
+    healthy and unchanged — skip the Haiku call entirely. The agent's prompt
+    already says "return [] for healthy devices" so this just saves the round
+    trip for the most common case.
+    """
     hostname = state.get("device_hostname", "unknown")
     log.info("topology_start", hostname=hostname)
     act_id = activity_bus.start(
@@ -38,6 +77,31 @@ async def topology_node(state: KopisState) -> dict:
 
     # Include diff summary if available
     diff = state.get("snapshot_diff", {})
+
+    # Short-circuit: healthy device + unchanged state = no Haiku call needed.
+    # The deterministic normaliser flags non-Established BGP/OSPF, down
+    # interfaces, high error counters, removed routes, etc. If it found
+    # nothing AND the diff has nothing meaningful, there's nothing for
+    # Haiku to analyse. Trust the extractor — it covers the cases that
+    # would have been actionable findings anyway.
+    if not anomalies and not _diff_has_meaningful_change(diff):
+        activity_bus.complete(
+            act_id,
+            tokens=0,
+            detail=f"Skipped Haiku for {hostname} — no anomalies, no meaningful diff",
+        )
+        log.info(
+            "topology_skipped_no_change",
+            hostname=hostname,
+            anomaly_count=len(anomalies),
+        )
+        return {
+            "findings": [],
+            "escalate_to_opus": False,
+            "processing_stage": "complete",
+            "tokens_used": state.get("tokens_used", {}),
+        }
+
     diff_section = ""
     if diff and not diff.get("note"):
         # Summarise the diff — focus on key changes, not raw data

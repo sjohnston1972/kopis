@@ -20,9 +20,10 @@ function getComplianceInfo(device) {
 }
 
 function getDeviceStatus(device) {
-  // Use last_refreshed (inventory sync) as the liveness signal.
-  // Devices are considered online if they were seen in the last refresh cycle (default 6h + buffer).
-  const ts = device.last_refreshed || device.last_seen;
+  // last_seen reflects the most recent telemetry point Telegraf saw for this
+  // specific device — that's real liveness. last_refreshed is just when we
+  // last synced the inventory list, so it's a fallback only.
+  const ts = device.last_seen || device.last_refreshed;
   if (!ts) return 'OFFLINE';
   const diff = Date.now() - new Date(ts).getTime();
   return diff < 24 * 60 * 60 * 1000 ? 'ONLINE' : 'OFFLINE';

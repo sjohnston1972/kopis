@@ -382,10 +382,133 @@ function FindingDetailModal({ findingId, onClose, onDismiss, onEscalate }) {
   );
 }
 
+/* ─── Incident Card ─── */
+function IncidentCard({ incident, onOpenFinding }) {
+  const [expanded, setExpanded] = useState(false);
+  const isCorrelated = incident.is_correlated;
+  const rec = incident.recommendation;
+  const approval = rec?.approval;
+  return (
+    <div className={`rounded-xl border p-4 ${
+      isCorrelated
+        ? 'bg-error/5 border-error/20'
+        : 'bg-surface-container-lowest border-outline/10'
+    }`}>
+      <div className="flex items-start gap-3">
+        <div className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 ${iconCircleBg(incident.max_severity)}`}>
+          <Icon name={isCorrelated ? 'hub' : severityIcon(incident.max_severity)} className="text-lg" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-1 flex-wrap">
+            <StatusChip variant={severityChipVariant(incident.max_severity)} dot>
+              {severityLabel(incident.max_severity)}
+            </StatusChip>
+            {/* Always show INCIDENT badge: 1-finding solo incidents say "1 finding · 1 device"
+                so the format is consistent and the count is always visible. */}
+            <span className={`text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full ${
+              isCorrelated
+                ? 'bg-error/15 text-error'
+                : 'bg-surface-container-high text-on-surface-variant'
+            }`}>
+              INCIDENT · {incident.finding_count} finding{incident.finding_count !== 1 ? 's' : ''} · {incident.affected_device_count} device{incident.affected_device_count !== 1 ? 's' : ''}
+            </span>
+            {incident.root_cause.agent_model && (
+              <span className="text-[10px] font-mono text-on-surface-variant/60">
+                {incident.root_cause.agent_model}
+              </span>
+            )}
+            {approval?.jira_key && (
+              <a href={approval.jira_url} target="_blank" rel="noreferrer"
+                className="text-[10px] font-bold text-primary hover:underline">
+                {approval.jira_key}
+              </a>
+            )}
+          </div>
+          <h3 className="text-base font-bold text-on-surface">
+            {incident.root_cause.title}
+          </h3>
+          <p className="text-xs text-on-surface-variant mt-1">
+            <Icon name="dns" className="text-sm align-middle" />{' '}
+            <span className="font-mono">{incident.affected_devices.join(', ')}</span>
+          </p>
+          {/* AI reasoning — surfaced from Sonnet's recommendation. */}
+          {rec?.reasoning && (
+            <div className="mt-3 bg-surface-container-low rounded-lg px-3 py-2.5 border border-outline/10">
+              <div className="flex items-center gap-1.5 mb-1">
+                <Icon name="psychology" className="text-sm text-primary" />
+                <span className="text-[10px] font-bold uppercase tracking-wide text-primary">AI Analysis</span>
+                {rec.risk_level && (
+                  <span className={`text-[10px] font-bold uppercase px-1.5 rounded-full ${
+                    rec.risk_level === 'high' ? 'bg-error/15 text-error' :
+                    rec.risk_level === 'medium' ? 'bg-tertiary/15 text-tertiary' :
+                    'bg-secondary/15 text-secondary'
+                  }`}>
+                    {rec.risk_level} risk
+                  </span>
+                )}
+                {approval?.status && (
+                  <span className="text-[10px] font-bold uppercase px-1.5 rounded-full bg-surface-container-high text-on-surface-variant ml-auto">
+                    {approval.status}
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-on-surface leading-relaxed line-clamp-3">{rec.reasoning}</p>
+              {rec.action && (
+                <p className="text-xs text-on-surface mt-1.5 font-medium">
+                  <Icon name="bolt" className="text-sm align-middle text-primary" /> {rec.action}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+        <button
+          onClick={() => onOpenFinding(incident.root_cause.id)}
+          className={`shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${btnColor(incident.max_severity)}`}
+        >
+          <Icon name="open_in_new" className="text-sm" />
+          Investigate
+        </button>
+      </div>
+      {isCorrelated && incident.linked_findings.length > 0 && (
+        <div className="mt-3 pl-12">
+          <button
+            onClick={() => setExpanded((e) => !e)}
+            className="flex items-center gap-1 text-[11px] font-bold text-on-surface-variant hover:text-on-surface transition-colors"
+          >
+            <Icon name={expanded ? 'expand_less' : 'expand_more'} className="text-base" />
+            {expanded ? 'Hide' : 'Show'} {incident.linked_findings.length} linked finding{incident.linked_findings.length === 1 ? '' : 's'}
+          </button>
+          {expanded && (
+            <div className="mt-2 space-y-1.5">
+              {incident.linked_findings.map((lf) => (
+                <button
+                  key={lf.id}
+                  onClick={() => onOpenFinding(lf.id)}
+                  className="w-full text-left flex items-center gap-2 px-3 py-2 bg-surface-container-low rounded-lg hover:bg-surface-container-high transition-colors"
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full ${
+                    severityColor(lf.severity) === 'error' ? 'bg-error' :
+                    severityColor(lf.severity) === 'tertiary' ? 'bg-tertiary' : 'bg-secondary'
+                  }`} />
+                  <span className="text-[11px] font-mono text-on-surface-variant">{lf.device_hostname}</span>
+                  <span className="text-xs text-on-surface flex-1 truncate">{lf.title}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 /* ─── Main Page ─── */
 export default function Insights() {
   const { data: findings, loading, error, refetch } = useApi(() => api.findings(), []);
-  usePipelineEvents(useCallback(() => refetch(), [refetch]));
+  const { data: incidents, refetch: refetchIncidents } = useApi(() => api.incidents(), []);
+  usePipelineEvents(useCallback(() => { refetch(); refetchIncidents(); }, [refetch, refetchIncidents]));
+  const [viewMode, setViewMode] = useState('incidents'); // 'incidents' | 'findings'
   const [openMenu, setOpenMenu] = useState(null);
   const [selectedFinding, setSelectedFinding] = useState(null);
   const [acting, setActing] = useState({}); // { [findingId]: 'dismiss'|'escalate' }
@@ -623,11 +746,61 @@ export default function Insights() {
               </div>
             </div>
 
-            {/* Risk Detection Grid */}
+            {/* Incidents view (default) */}
+            {viewMode === 'incidents' && (
+              <div>
+                <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+                  <h2 className="text-lg font-bold text-on-surface">Active Incidents</h2>
+                  <div className="flex bg-surface-container-low rounded-lg p-0.5">
+                    <button
+                      onClick={() => setViewMode('incidents')}
+                      className="px-3 py-1 rounded-md text-[11px] font-bold bg-white shadow-sm text-on-surface"
+                    >
+                      Incidents
+                    </button>
+                    <button
+                      onClick={() => setViewMode('findings')}
+                      className="px-3 py-1 rounded-md text-[11px] font-bold text-on-surface-variant hover:text-on-surface"
+                    >
+                      All findings
+                    </button>
+                  </div>
+                </div>
+                {!incidents || incidents.length === 0 ? (
+                  <div className="bg-surface-container-lowest rounded-xl border border-outline/10 p-10 text-center">
+                    <Icon name="verified" className="text-4xl text-secondary mb-2" />
+                    <p className="text-sm text-on-surface-variant">No active incidents. Network looks clean.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {incidents.map((inc) => (
+                      <IncidentCard key={inc.root_cause.id} incident={inc} onOpenFinding={openDetail} />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Risk Detection Grid (findings view) */}
+            {viewMode === 'findings' && (
             <div>
               <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
                 <div className="flex items-center gap-3">
-                  <h2 className="text-lg font-bold text-on-surface">Risk Detection</h2>
+                  <h2 className="text-lg font-bold text-on-surface">All Findings</h2>
+                  <div className="flex bg-surface-container-low rounded-lg p-0.5">
+                    <button
+                      onClick={() => setViewMode('incidents')}
+                      className="px-3 py-1 rounded-md text-[11px] font-bold text-on-surface-variant hover:text-on-surface"
+                    >
+                      Incidents
+                    </button>
+                    <button
+                      onClick={() => setViewMode('findings')}
+                      className="px-3 py-1 rounded-md text-[11px] font-bold bg-white shadow-sm text-on-surface"
+                    >
+                      All findings
+                    </button>
+                  </div>
                   {selectedIds.size > 0 && (
                     <span className="text-xs font-bold text-primary bg-primary/10 px-2 py-0.5 rounded-full">
                       {selectedIds.size} selected
@@ -789,6 +962,7 @@ export default function Insights() {
                 </div>
               )}
             </div>
+            )}
           </div>
 
           {/* ===== RIGHT SIDEBAR (col-span-4) ===== */}

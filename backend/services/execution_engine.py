@@ -41,7 +41,14 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
     )
     finding = finding_result.scalar_one_or_none()
     if not finding:
-        return {"error": "Finding not found"}
+        # Finding was dismissed/deleted between approval and execution.
+        # Don't run commands for a problem the operator already cleared.
+        await approval_service.mark_executed(
+            db, approval_id,
+            {"error": "Finding no longer exists (dismissed)", "skipped": True, "outputs": []},
+            success=False,
+        )
+        return {"error": "Finding was dismissed before execution; skipping"}
 
     device_result = await db.execute(
         select(Device).where(Device.id == finding.device_id)
@@ -49,6 +56,34 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
     device = device_result.scalar_one_or_none()
     if not device:
         return {"error": "Device not found"}
+
+    # Pre-flight sanity check: take a fresh single-device snapshot and
+    # verify the finding's symptom still applies. Avoids running stale
+    # config changes on devices that have already self-recovered or had
+    # their issue manually fixed in the time between approval and execute.
+    try:
+        from services.snapshot_engine import take_snapshot
+        fresh = await take_snapshot(db, device_id=device.id, triggered_by="pre-exec-check")
+        still_present = _symptom_still_present(finding, fresh[0].snapshot_data if fresh else {})
+        if not still_present:
+            log.info("execution_skipped_symptom_resolved",
+                     approval_id=approval_id, finding_id=finding.id, hostname=device.hostname)
+            await approval_service.mark_executed(
+                db, approval_id,
+                {
+                    "skipped": True,
+                    "reason": "Pre-flight check: symptom no longer present on device",
+                    "hostname": device.hostname,
+                    "outputs": [],
+                    "success": True,
+                },
+                success=True,
+            )
+            return {"skipped": True, "reason": "Symptom resolved before execution"}
+    except Exception as exc:
+        # If pre-flight fails, log but don't block — the operator approved,
+        # and a flaky pre-flight shouldn't be a hard gate.
+        log.warning("pre_exec_check_failed", error=str(exc), approval_id=approval_id)
 
     # Extract commands
     commands = rec.commands
@@ -130,27 +165,41 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
         approval, "executed" if success else "failed"
     )
 
-    # Trigger verification snapshot + pipeline re-analysis
+    # Trigger verification snapshot for the fixed device AND all other
+    # devices in the same incident. The fix on Device A typically resolves
+    # cascading findings on devices B–N (e.g. route withdrawals heal once
+    # the link comes back up). Re-snapshotting them all surfaces the fix
+    # in the dashboard / clears stale findings via the carry-forward
+    # dedup. Without this, downstream devices' findings linger as
+    # "active" until the next scheduled snapshot.
     if success:
+        # Find every device that had a finding in this incident
+        verify_device_ids: set[str] = {device.id}
+        if finding.incident_id:
+            inc_result = await db.execute(
+                select(Finding.device_id).where(Finding.incident_id == finding.incident_id)
+            )
+            verify_device_ids.update(row[0] for row in inc_result.all())
+
+        verify_devices_q = await db.execute(
+            select(Device).where(Device.id.in_(verify_device_ids))
+        )
+        verify_devices = list(verify_devices_q.scalars().all())
+
         snap_act_id = activity_bus.start(
             pipeline_run=f"verify:{approval_id}",
             node="verification",
             model="pyats",
             device=device.hostname,
-            detail=f"Taking verification snapshot of {device.hostname}",
+            detail=f"Verification snapshot of {len(verify_devices)} incident device(s)",
         )
         try:
-            from services.snapshot_engine import take_snapshot
+            from agents.graph import run_pipeline
+            from services.snapshot_engine import get_snapshot_diff, take_snapshot
 
-            log.info("verification_snapshot_start", hostname=device.hostname)
-            new_snaps = await take_snapshot(db, device_id=device.id, triggered_by="post-execution")
-            activity_bus.complete(snap_act_id, detail=f"Verification snapshot of {device.hostname} complete")
-
-            # Auto-trigger pipeline on the new snapshot
-            if new_snaps:
-                from agents.graph import run_pipeline
-                from services.snapshot_engine import get_snapshot_diff
-
+            for vdev in verify_devices:
+                log.info("verification_snapshot_start", hostname=vdev.hostname)
+                new_snaps = await take_snapshot(db, device_id=vdev.id, triggered_by="post-execution-verify")
                 for snap in new_snaps:
                     try:
                         diff_result = await get_snapshot_diff(db, snap.id)
@@ -158,14 +207,18 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
                         await run_pipeline(
                             db=db,
                             snapshot_id=snap.id,
-                            device_id=device.id,
-                            device_hostname=device.hostname,
-                            device_platform=device.platform,
+                            device_id=vdev.id,
+                            device_hostname=vdev.hostname,
+                            device_platform=vdev.platform,
                             raw_snapshot=snap.snapshot_data,
                             snapshot_diff=snapshot_diff,
+                            create_approvals=False,  # don't generate new approvals on verify
+                            defer_remediation=True,
                         )
                     except Exception as pipe_err:
-                        log.error("verification_pipeline_failed", hostname=device.hostname, error=str(pipe_err))
+                        log.error("verification_pipeline_failed", hostname=vdev.hostname, error=str(pipe_err))
+
+            activity_bus.complete(snap_act_id, detail=f"Verified {len(verify_devices)} device(s)")
         except Exception as e:
             log.warning("verification_snapshot_failed", error=str(e))
             activity_bus.fail(snap_act_id, f"Verification snapshot failed: {e}")
@@ -173,15 +226,118 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
     return result
 
 
+_MODE_BOUNDARIES = {
+    "configure terminal", "config terminal", "config t", "conf t",
+    "end", "exit",
+}
+
+
+def _symptom_still_present(finding: Finding, snapshot_data: dict) -> bool:
+    """Verify the finding's symptom still exists in the fresh snapshot.
+
+    Only checks the most common, high-confidence symptom types. For symptom
+    types we can't reliably re-check (e.g. abstract policy issues), we
+    return True (i.e. assume it's still relevant — don't block).
+    """
+    if not snapshot_data or not isinstance(snapshot_data, dict):
+        return True
+
+    title = (finding.title or "").lower()
+    affected = (finding.affected_entity or "").lower()
+
+    # Interface admin-down / oper-down — confirm the named interface is
+    # still actually down. If admin re-enabled, no need to re-enable again.
+    if finding.category == "interface" or "interface" in title:
+        intf_name = None
+        for token in (finding.affected_entity or "").split():
+            if any(token.lower().startswith(p) for p in (
+                "ethernet", "gigabitethernet", "tengigabitethernet",
+                "fastethernet", "loopback", "tunnel", "vlan", "port-channel",
+            )):
+                intf_name = token
+                break
+        if intf_name:
+            intf = snapshot_data.get("interface", {}).get(intf_name)
+            if isinstance(intf, dict):
+                # Symptom = down/admin-down. Resolved if oper_status=up AND enabled=true.
+                if intf.get("oper_status") == "up" and intf.get("enabled") is True:
+                    return False
+        return True
+
+    # BGP neighbour in non-Established state — verify it's still not
+    # Established. If it's recovered, no need to fix.
+    if finding.category == "routing" and "bgp" in title and "neighbor" in title:
+        peer_ip = None
+        for token in affected.split():
+            if token.count(".") == 3:
+                peer_ip = token
+                break
+        if peer_ip:
+            bgp = snapshot_data.get("bgp", {})
+            for inst in (bgp.get("instance", {}) if isinstance(bgp, dict) else {}).values():
+                if not isinstance(inst, dict):
+                    continue
+                for vrf in inst.get("vrf", {}).values():
+                    if not isinstance(vrf, dict):
+                        continue
+                    nbr = vrf.get("neighbor", {}).get(peer_ip)
+                    if isinstance(nbr, dict) and nbr.get("session_state") == "Established":
+                        return False
+        return True
+
+    return True  # Default: don't block
+
+
+def _classify_commands(commands: list[str]) -> tuple[list[str], list[str]]:
+    """Split a flat command list into (exec_commands, config_commands).
+
+    Strips mode-boundary tokens (configure terminal / end / exit). pyATS
+    handles mode transitions itself via execute() vs configure().
+
+    Heuristic: anything inside a 'configure terminal' ... 'end' block is
+    config; anything outside is exec. Commands starting with 'show', 'ping',
+    'traceroute', 'clear' are always exec even if appearing inside a block.
+    """
+    exec_cmds: list[str] = []
+    cfg_cmds: list[str] = []
+    in_config = False
+
+    for raw in commands:
+        cmd = raw.strip()
+        low = cmd.lower()
+        if low in _MODE_BOUNDARIES:
+            if low.startswith("conf"):
+                in_config = True
+            elif low in {"end", "exit"} and in_config:
+                in_config = False
+            continue
+        # Show/diagnostic commands are exec regardless of mode
+        first = low.split()[0] if low else ""
+        if first in {"show", "ping", "traceroute", "clear", "reload", "write"}:
+            exec_cmds.append(cmd)
+        elif in_config:
+            cfg_cmds.append(cmd)
+        else:
+            exec_cmds.append(cmd)
+
+    return exec_cmds, cfg_cmds
+
+
 def _send_commands_sync(device, commands: list[str]) -> dict:
     """Connect to a device and send commands (blocking — run via asyncio.to_thread).
 
-    Uses pyATS Unicon if available, falls back to a dry-run mode.
+    Splits commands into exec vs config groups; uses tb_device.execute() for
+    exec commands and tb_device.configure() for config commands. The latter
+    handles 'configure terminal' / 'end' transitions internally — feeding it
+    those tokens (or running config commands through execute()) puts the
+    session into the wrong state and every subsequent command fails.
     """
     from services.testbed_generator import generate_testbed
 
     outputs: list[dict] = []
     start = time.time()
+
+    exec_cmds, cfg_cmds = _classify_commands(commands)
 
     try:
         from genie.testbed import load as load_testbed
@@ -199,15 +355,33 @@ def _send_commands_sync(device, commands: list[str]) -> dict:
             connection_timeout=settings.pyats_connect_timeout,
         )
 
-        for cmd in commands:
+        # Run exec commands first (e.g. 'show' diagnostics), then config block.
+        for cmd in exec_cmds:
             try:
                 output = tb_device.execute(cmd, timeout=settings.pyats_command_timeout)
                 outputs.append({"command": cmd, "output": output, "success": True})
             except Exception as e:
-                outputs.append(
-                    {"command": cmd, "output": str(e), "success": False}
-                )
-                break
+                outputs.append({"command": cmd, "output": str(e), "success": False})
+                # Don't bail on a failed show — but DO bail before changing config
+                if cmd.lower().split()[0] not in {"show", "ping", "traceroute"}:
+                    break
+
+        # Apply config commands as one transactional block — pyATS handles
+        # 'configure terminal' / 'end' / commit semantics itself.
+        if cfg_cmds and (not outputs or all(o["success"] for o in outputs)):
+            try:
+                output = tb_device.configure(cfg_cmds, timeout=settings.pyats_command_timeout)
+                outputs.append({
+                    "command": "configure { " + "; ".join(cfg_cmds) + " }",
+                    "output": output if isinstance(output, str) else str(output),
+                    "success": True,
+                })
+            except Exception as e:
+                outputs.append({
+                    "command": "configure { " + "; ".join(cfg_cmds) + " }",
+                    "output": str(e),
+                    "success": False,
+                })
 
         try:
             tb_device.disconnect()
@@ -221,7 +395,7 @@ def _send_commands_sync(device, commands: list[str]) -> dict:
             )
 
     duration = round(time.time() - start, 2)
-    all_success = all(o["success"] for o in outputs)
+    all_success = bool(outputs) and all(o["success"] for o in outputs)
 
     return {
         "hostname": device.hostname,

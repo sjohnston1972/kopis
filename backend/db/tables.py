@@ -36,8 +36,11 @@ class Device(Base):
     first_seen: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # last_seen is the timestamp of the most recent telemetry point Grafana
+    # has for this device — set explicitly by the inventory service.
+    # No onupdate trigger: row updates must NOT clobber this signal.
     last_seen: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+        DateTime(timezone=True), server_default=func.now()
     )
     last_refreshed: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -85,6 +88,11 @@ class Finding(Base):
     requires_remediation: Mapped[bool] = mapped_column(Boolean, default=False)
     agent_model: Mapped[str | None] = mapped_column(String(100))
     tokens_used: Mapped[int | None] = mapped_column(Integer)
+    # Correlation: findings sharing an incident_id describe the same network event
+    # observed from multiple devices. is_root_cause marks the primary one.
+    incident_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    is_root_cause: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    correlation_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

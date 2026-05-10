@@ -22,6 +22,10 @@ def _route_after_topology(state: KopisState) -> str:
     """Conditional edge: decide where to go after the topology agent."""
     if state.get("force_escalation") or state.get("escalate_to_opus"):
         return "escalation"
+    # In batch (multi-device) mode, stop here. Remediation is generated
+    # post-correlation, once per incident — not once per device.
+    if state.get("defer_remediation"):
+        return "complete"
     stage = state.get("processing_stage", "complete")
     if stage == "remediation":
         # Check if any findings want Opus-level remediation
@@ -101,10 +105,18 @@ async def run_pipeline(
     raw_snapshot: dict,
     force_escalation: bool = False,
     snapshot_diff: dict | None = None,
+    create_approvals: bool = True,
+    defer_remediation: bool = False,
 ) -> KopisState:
     """Execute the full LangGraph pipeline for a single device snapshot.
 
-    Persists findings, recommendations, and approvals to the database.
+    Persists findings and recommendations. When ``create_approvals`` is True
+    (the default, used for single-device manual reruns), also creates the
+    pending approval, Jira ticket, and Slack notification per recommendation.
+
+    When ``create_approvals`` is False (used by the multi-device snapshot
+    route), approvals/Jira/Slack are deferred so the cross-device correlation
+    step can collapse cascade duplicates into a single incident first.
     """
     if pipeline is None:
         raise RuntimeError("LangGraph is not installed")
@@ -129,6 +141,7 @@ async def run_pipeline(
         "recommendations": [],
         "escalate_to_opus": False,
         "force_escalation": force_escalation,
+        "defer_remediation": defer_remediation,
         "processing_stage": "normalise",
         "errors": [],
         "tokens_used": {},
@@ -186,10 +199,22 @@ async def run_pipeline(
                 similar_to=similar[0]["finding_id"],
                 distance=similar[0]["distance"],
             )
-            # Map the AI ID but mark as deduped — skip DB insert and recommendations
+            # Map the AI ID to the existing finding's real ID. Update the
+            # existing finding's snapshot_id to THIS snapshot — it's still
+            # the same problem, just re-observed in a fresh snapshot. This
+            # keeps cross-device correlation (which queries by snapshot_id)
+            # honest about what's currently affecting the network.
             old_id = f.get("id", "")
-            finding_id_map[old_id] = similar[0]["finding_id"]
-            deduped_finding_ids.add(similar[0]["finding_id"])
+            existing_id = similar[0]["finding_id"]
+            finding_id_map[old_id] = existing_id
+            deduped_finding_ids.add(existing_id)
+
+            existing_row = await db.execute(
+                sa_select(Finding).where(Finding.id == existing_id)
+            )
+            existing_finding = existing_row.scalar_one_or_none()
+            if existing_finding is not None:
+                existing_finding.snapshot_id = snapshot_id
             continue
 
         old_id = f.get("id", "")
@@ -229,14 +254,16 @@ async def run_pipeline(
     if deduped_count:
         log.info("findings_deduped_total", count=deduped_count, kept=len(new_findings))
 
-    # Persist recommendations, create approval records, and raise Jira tickets
-    from integrations.jira import jira_client
-    from integrations.slack import slack_client
-
-    # Build a finding lookup for linking recommendations to finding details
+    # Persist recommendations. Approvals/Jira/Slack are conditional —
+    # in multi-device runs we defer them so the correlation pass can
+    # collapse cascade duplicates into one incident.
     finding_lookup: dict[str, dict] = {
         f.get("id", ""): f for f in final_state.get("findings", [])
     }
+
+    if create_approvals:
+        from integrations.jira import jira_client
+        from integrations.slack import slack_client
 
     for r in final_state.get("recommendations", []):
         # Remap AI-generated finding_id to the real UUID we assigned
@@ -260,6 +287,9 @@ async def run_pipeline(
             tokens_used=None,
         )
         db.add(rec)
+
+        if not create_approvals:
+            continue
 
         # Auto-create a pending approval for each recommendation
         approval = Approval(recommendation_id=rec_id, status="pending")
@@ -311,12 +341,15 @@ async def run_pipeline(
 
     await db.commit()
 
-    # Send Slack summary of all findings
-    await slack_client.notify_new_findings(
-        device_hostname=device_hostname,
-        findings=final_state.get("findings", []),
-        recommendations_count=len(final_state.get("recommendations", [])),
-    )
+    # Per-device Slack summary — skipped in deferred mode; the multi-device
+    # caller posts ONE incident summary after correlation instead.
+    if create_approvals:
+        from integrations.slack import slack_client
+        await slack_client.notify_new_findings(
+            device_hostname=device_hostname,
+            findings=final_state.get("findings", []),
+            recommendations_count=len(final_state.get("recommendations", [])),
+        )
 
     log.info(
         "pipeline_complete",
