@@ -515,11 +515,17 @@ async def generate_incident_remediations(
         if not root.requires_remediation:
             continue
 
-        # Already has a recommendation? Skip (re-run safety).
-        existing = await db.execute(
-            select(Recommendation).where(Recommendation.finding_id == root.id)
+        # Skip only if there's an OPEN approval (pending or approved). An
+        # already-executed/denied/expired approval from a prior occurrence
+        # of the same finding (carried forward by ChromaDB dedup) is a
+        # closed loop — the issue has come back, generate fresh advice.
+        open_q = await db.execute(
+            select(Approval)
+            .join(Recommendation, Approval.recommendation_id == Recommendation.id)
+            .where(Recommendation.finding_id == root.id)
+            .where(Approval.status.in_(["pending", "approved"]))
         )
-        if existing.scalars().first() is not None:
+        if open_q.scalars().first() is not None:
             continue
 
         root_host = dev_map.get(root.device_id, "unknown")
@@ -632,7 +638,7 @@ async def create_incident_approvals(
     for inc in incidents:
         root = inc.root_cause
         # Find the recommendation for the root finding. Multiple may exist
-        # in edge cases (re-runs); take the most recent.
+        # in edge cases (re-runs / recurring incidents); take the most recent.
         rec_result = await db.execute(
             select(Recommendation)
             .where(Recommendation.finding_id == root.id)
@@ -642,11 +648,16 @@ async def create_incident_approvals(
         if rec is None:
             continue  # root finding doesn't need remediation — no approval needed
 
-        # Already approved? Skip (re-run safety)
-        existing = await db.execute(
-            select(Approval).where(Approval.recommendation_id == rec.id)
+        # Skip only if there's an OPEN approval (pending or approved) for
+        # THIS specific recommendation. An old executed/denied approval on
+        # an earlier recommendation for the same finding is a closed loop;
+        # the new recommendation deserves a fresh approval.
+        existing_open = await db.execute(
+            select(Approval)
+            .where(Approval.recommendation_id == rec.id)
+            .where(Approval.status.in_(["pending", "approved"]))
         )
-        if existing.scalars().first() is not None:
+        if existing_open.scalars().first() is not None:
             continue
 
         host = dev_map.get(root.device_id, "unknown")
