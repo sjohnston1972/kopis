@@ -103,7 +103,7 @@ export default function ChatPanel({ state, onStateChange }) {
     setStreaming(true);
 
     const assistantIdx = next.length;
-    setMessages((prev) => [...prev, { role: 'assistant', content: '' }]);
+    setMessages((prev) => [...prev, { role: 'assistant', content: '', toolCalls: [] }]);
 
     try {
       const controller = new AbortController();
@@ -138,13 +138,38 @@ export default function ChatPanel({ state, onStateChange }) {
           if (data === '[DONE]') break;
           try {
             const parsed = JSON.parse(data);
-            if (parsed.text) {
+            // New event protocol: tool_use / tool_result / text
+            if (parsed.type === 'tool_use') {
               setMessages((prev) => {
                 const copy = [...prev];
+                const cur = copy[assistantIdx] || { role: 'assistant', content: '', toolCalls: [] };
                 copy[assistantIdx] = {
-                  role: 'assistant',
-                  content: copy[assistantIdx].content + parsed.text,
+                  ...cur,
+                  toolCalls: [...(cur.toolCalls || []), { name: parsed.name, input: parsed.input, status: 'running' }],
                 };
+                return copy;
+              });
+            } else if (parsed.type === 'tool_result') {
+              setMessages((prev) => {
+                const copy = [...prev];
+                const cur = copy[assistantIdx] || { role: 'assistant', content: '', toolCalls: [] };
+                const calls = [...(cur.toolCalls || [])];
+                // Mark the matching most-recent running call as done.
+                for (let j = calls.length - 1; j >= 0; j--) {
+                  if (calls[j].name === parsed.name && calls[j].status === 'running') {
+                    calls[j] = { ...calls[j], status: 'done', preview: parsed.preview };
+                    break;
+                  }
+                }
+                copy[assistantIdx] = { ...cur, toolCalls: calls };
+                return copy;
+              });
+            } else if (parsed.type === 'text' || parsed.text) {
+              const txt = parsed.text || '';
+              setMessages((prev) => {
+                const copy = [...prev];
+                const cur = copy[assistantIdx] || { role: 'assistant', content: '', toolCalls: [] };
+                copy[assistantIdx] = { ...cur, content: (cur.content || '') + txt };
                 return copy;
               });
             }
@@ -283,10 +308,10 @@ export default function ChatPanel({ state, onStateChange }) {
             <p className="text-sm font-semibold">Ask about your network</p>
             <div className="flex flex-wrap gap-2 justify-center max-w-[320px]">
               {[
-                'Summarise network health',
-                'Which BGP sessions are down?',
-                'Show me DC1 routers',
-                'Any critical findings?',
+                'Summarise active incidents',
+                'What\'s the BGP state on DC1-R1?',
+                'Run "show ip route 10.10.1.0" on S1-R1',
+                'Have we seen this kind of issue before?',
               ].map((q) => (
                 <button
                   key={q}
@@ -310,15 +335,47 @@ export default function ChatPanel({ state, onStateChange }) {
               }`}
             >
               {msg.role === 'assistant' ? (
-                msg.content ? (
-                  <Markdown text={msg.content} />
-                ) : (
-                  <div className="flex items-center gap-2 py-1">
-                    <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
-                    <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse [animation-delay:150ms]" />
-                    <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse [animation-delay:300ms]" />
-                  </div>
-                )
+                <>
+                  {/* Tool-call ribbon: show what the assistant queried */}
+                  {(msg.toolCalls && msg.toolCalls.length > 0) && (
+                    <div className="mb-2 space-y-1">
+                      {msg.toolCalls.map((tc, j) => (
+                        <div key={j} className="flex items-start gap-2 text-[11px] text-on-surface-variant">
+                          <Icon
+                            name={tc.status === 'done' ? 'check_circle' : 'progress_activity'}
+                            className={`text-[14px] mt-0.5 shrink-0 ${tc.status === 'done' ? 'text-secondary' : 'text-primary animate-spin'}`}
+                          />
+                          <div className="flex-1 min-w-0">
+                            <span className="font-mono font-semibold text-primary">{tc.name}</span>
+                            {tc.input && Object.keys(tc.input).length > 0 && (
+                              <span className="text-on-surface-variant/70">
+                                {' '}({Object.entries(tc.input).slice(0, 2).map(([k, v]) =>
+                                  `${k}=${typeof v === 'string' ? `"${v.length > 30 ? v.slice(0,30)+'…' : v}"` : JSON.stringify(v)}`
+                                ).join(', ')})
+                              </span>
+                            )}
+                            {tc.preview && (
+                              <div className="text-[10px] text-on-surface-variant/60 italic line-clamp-1 mt-0.5">
+                                → {tc.preview}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {msg.content ? (
+                    <Markdown text={msg.content} />
+                  ) : (
+                    !msg.toolCalls?.length && (
+                      <div className="flex items-center gap-2 py-1">
+                        <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+                        <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse [animation-delay:150ms]" />
+                        <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse [animation-delay:300ms]" />
+                      </div>
+                    )
+                  )}
+                </>
               ) : (
                 <p className="text-sm">{msg.content}</p>
               )}

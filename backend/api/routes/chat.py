@@ -1,19 +1,42 @@
-"""Chat endpoint — streaming conversation with Claude about this network."""
+"""Chat endpoint — agentic conversation with Claude about this network.
+
+Claude has access to a tool registry (services/chat_tools.py) of read-only
+network queries plus a snapshot trigger and a safe show-command runner.
+Each user message kicks off an agentic loop:
+  1. Send messages + tools to Claude
+  2. If response has tool_use blocks, execute each tool
+  3. Append tool_results to messages, loop back to step 1
+  4. When Claude returns end_turn, stream the final text back to the UI
+
+The protocol back to the frontend is SSE with three event shapes:
+  data: {"type": "tool_use",    "name": ..., "input": {...}}
+  data: {"type": "tool_result", "name": ..., "preview": "..."}
+  data: {"type": "text",        "text": "..."}
+  data: [DONE]
+
+A short system prompt sets the agent's role and orientation. The big
+context dumps the old chat used to inject (full inventory, every
+snapshot summary, all findings) are gone — Claude fetches what it
+needs via tools, which keeps a "hello" cheap and lets a real
+diagnostic question pull only the relevant data.
+"""
+
+from __future__ import annotations
 
 import json
-import re
 
 import httpx
 import structlog
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
 from db.postgres import get_db
-from db.tables import Device, Snapshot, Finding
+from db.tables import Device
+from services.chat_tools import TOOLS, execute_tool
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 log = structlog.get_logger()
@@ -22,321 +45,195 @@ ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 
 
 class ChatRequest(BaseModel):
-    messages: list[dict]  # [{"role": "user"|"assistant", "content": str}]
+    messages: list[dict]
     model: str | None = None
 
 
-def _summarise_snapshot(snap_data: dict) -> str:
-    """Build a concise text summary of a pyATS snapshot."""
-    if not isinstance(snap_data, dict):
-        return "  (invalid snapshot data)"
+SYSTEM_PROMPT = """You are Kopis, an AI network operations assistant for a homelab network running in GNS3.
 
-    if "error" in snap_data:
-        return f"  Error: {snap_data['error']}"
+You're an experienced network engineer with deep knowledge of Cisco IOS-XE, IOS-v, NX-OS, BGP, OSPF, spanning-tree, VLANs, and enterprise routing. The operator you're talking to is also a network engineer — be direct and technically dense, skip the basics.
 
-    sections = []
+## How you work
 
-    # Interfaces
-    intfs = snap_data.get("interface", {})
-    if isinstance(intfs, dict):
-        up, down, total = 0, 0, 0
-        intf_details = []
-        for name, data in intfs.items():
-            if not isinstance(data, dict):
-                continue
-            total += 1
-            oper = data.get("oper_status", "unknown")
-            if oper == "up":
-                up += 1
-            else:
-                down += 1
-            # Include IP info
-            ipv4 = data.get("ipv4", {})
-            ips = list(ipv4.keys()) if isinstance(ipv4, dict) else []
-            status = "UP" if oper == "up" else "DOWN"
-            line = f"    {name}: {status}"
-            if ips:
-                line += f" ({', '.join(ips)})"
-            # Error counters
-            counters = data.get("counters", {})
-            if isinstance(counters, dict):
-                in_err = counters.get("in_errors", 0)
-                out_err = counters.get("out_errors", 0)
-                in_disc = counters.get("in_discards", 0)
-                if in_err or out_err or in_disc:
-                    line += f" [errors: in={in_err} out={out_err} discards={in_disc}]"
-            intf_details.append(line)
-        sections.append(f"  Interfaces: {up} up / {down} down / {total} total")
-        if intf_details:
-            sections.append("\n".join(intf_details))
+You have **tools** for reading the network's current state — device inventory, snapshots, findings, incidents, topology, approvals, execution history, semantic search over historical findings. You also have a snapshot trigger and a safe show-command runner.
 
-    # BGP
-    bgp = snap_data.get("bgp", {})
-    if isinstance(bgp, dict):
-        neighbors = []
-        for inst in bgp.get("instance", {}).values():
-            if not isinstance(inst, dict):
-                continue
-            for vrf_name, vrf in inst.get("vrf", {}).items():
-                if not isinstance(vrf, dict):
-                    continue
-                for neigh_ip, ndata in vrf.get("neighbor", {}).items():
-                    if not isinstance(ndata, dict):
-                        continue
-                    state = ndata.get("session_state", "Unknown")
-                    remote_as = ndata.get("remote_as", "?")
-                    neighbors.append(f"    {neigh_ip} AS{remote_as} — {state}")
-        if neighbors:
-            sections.append("  BGP Neighbors:")
-            sections.append("\n".join(neighbors))
+**Use tools instead of guessing.** If the user asks about a specific device, call `get_device_snapshot`. If they ask about active issues, call `list_incidents` (preferred) or `list_findings`. If they ask "have we seen this before?", call `search_historical_findings`. If you need real-time state (the snapshot might be stale), use `run_show_command` with a `show` command.
 
-    # OSPF
-    ospf = snap_data.get("ospf", {})
-    if isinstance(ospf, dict):
-        ospf_lines = []
-        for inst_id, inst in ospf.get("vrf", {}).items() if isinstance(ospf.get("vrf"), dict) else []:
-            pass
-        # Try alternative structure
-        for inst_key, inst in ospf.items():
-            if not isinstance(inst, dict):
-                continue
-            areas = inst.get("areas", {})
-            if isinstance(areas, dict):
-                for area_id, area in areas.items():
-                    intfs_in_area = area.get("interfaces", {}) if isinstance(area, dict) else {}
-                    intf_names = list(intfs_in_area.keys()) if isinstance(intfs_in_area, dict) else []
-                    if intf_names:
-                        ospf_lines.append(f"    Area {area_id}: {', '.join(intf_names)}")
-        if ospf_lines:
-            sections.append("  OSPF:")
-            sections.append("\n".join(ospf_lines))
+Prefer `list_incidents` over `list_findings` for the operator-facing summary — incidents are the de-duplicated, correlated, root-cause-picked view. Findings are the raw underlying observations.
 
-    # VLANs
-    vlan = snap_data.get("vlan", {})
-    if isinstance(vlan, dict):
-        vlans = vlan.get("vlans", {})
-        if isinstance(vlans, dict) and vlans:
-            vlan_list = []
-            for vid, vdata in sorted(vlans.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 9999):
-                name = vdata.get("name", "") if isinstance(vdata, dict) else ""
-                state = vdata.get("state", "") if isinstance(vdata, dict) else ""
-                vlan_list.append(f"    VLAN {vid}: {name} ({state})")
-            sections.append("  VLANs:")
-            sections.append("\n".join(vlan_list[:20]))  # Cap at 20
+## What you cannot do
 
-    # Platform
-    platform = snap_data.get("platform", {})
-    if isinstance(platform, dict):
-        chassis = platform.get("chassis", "")
-        version = platform.get("os", platform.get("software_version", ""))
-        uptime = platform.get("uptime", "")
-        if chassis or version:
-            sections.append(f"  Platform: {chassis} {version}")
-        if uptime:
-            sections.append(f"  Uptime: {uptime}")
+You cannot approve, deny, or execute remediations. You cannot modify device config. Those operations require explicit human action through the Approval flow with full audit trail. If the operator asks you to "fix" something, walk them through what's needed and point at the pending approval (or suggest they trigger a snapshot if the issue isn't yet detected).
 
-    # Routing table summary
-    routing = snap_data.get("routing", {})
-    if isinstance(routing, dict):
-        for vrf_name, vrf in routing.get("vrf", {}).items():
-            if not isinstance(vrf, dict):
-                continue
-            for af_name, af in vrf.get("address_family", {}).items():
-                if not isinstance(af, dict):
-                    continue
-                routes = af.get("routes", {})
-                if isinstance(routes, dict):
-                    sections.append(f"  Routes ({vrf_name}/{af_name}): {len(routes)} entries")
+`run_show_command` only accepts diagnostic commands (show / ping / traceroute) — anything else is rejected at the tool boundary.
 
-    return "\n".join(sections) if sections else "  (snapshot collected but no parseable features)"
+## Style
+
+- Be concise. Code blocks for CLI. No marketing fluff.
+- When you reference a device, finding, or incident, use its short hostname or 8-char id so the operator can find it in the UI.
+- If a tool returns no results, say so — don't fabricate a plausible-looking answer.
+- Multi-step diagnostics: chain tool calls. Don't ask the operator for permission to call read-only tools."""
 
 
-def _find_mentioned_devices(user_message: str, hostnames: list[str]) -> list[str]:
-    """Find device hostnames mentioned in the user's message."""
-    msg_lower = user_message.lower()
-    matched = []
-    for hostname in hostnames:
-        short = hostname.split(".")[0].lower()
-        if short in msg_lower or hostname.lower() in msg_lower:
-            matched.append(hostname)
-    return matched
+def _truncate(s: str, n: int = 240) -> str:
+    """Compact preview shown to the UI for each tool result."""
+    if not s:
+        return ""
+    s = s.replace("\n", " ").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
-async def _build_system_prompt(db: AsyncSession, user_message: str) -> str:
-    """Build a system prompt with live network context."""
-    # Device summary
-    result = await db.execute(
-        select(
-            Device.device_type,
-            func.count(Device.id),
-        ).group_by(Device.device_type)
-    )
-    type_counts = {row[0]: row[1] for row in result.all()}
-    total_devices = sum(type_counts.values())
-
-    # All devices
-    result = await db.execute(
-        select(Device).order_by(Device.hostname)
-    )
-    devices = list(result.scalars().all())
-    hostnames = [d.hostname for d in devices]
-    device_map = {d.id: d for d in devices}
-
-    device_list = "\n".join(
-        f"  - {d.hostname} ({d.management_ip}) — {d.platform} {d.device_type}"
-        for d in devices
-    )
-
-    # Snapshot stats
-    result = await db.execute(select(func.count(Snapshot.id)))
-    snap_count = result.scalar() or 0
-
-    # Latest successful snapshot per device
-    latest_sq = (
-        select(Snapshot.device_id, func.max(Snapshot.created_at).label("max_ts"))
-        .where(func.array_length(Snapshot.features_learned, 1) > 0)
-        .group_by(Snapshot.device_id)
-        .subquery()
-    )
-    result = await db.execute(
-        select(Snapshot)
-        .join(
-            latest_sq,
-            (Snapshot.device_id == latest_sq.c.device_id)
-            & (Snapshot.created_at == latest_sq.c.max_ts),
-        )
-    )
-    snapshots = {s.device_id: s for s in result.scalars().all()}
-
-    # Find which devices the user is asking about
-    mentioned = _find_mentioned_devices(user_message, hostnames)
-
-    # Build snapshot sections
-    # For mentioned devices: full detail. For others: one-line summary.
-    mentioned_set = set(d.hostname for d in devices if d.hostname in mentioned)
-    snapshot_sections = []
-
-    for device in devices:
-        snap = snapshots.get(device.id)
-        short = device.hostname.split(".")[0]
-        if not snap or not isinstance(snap.snapshot_data, dict):
-            snapshot_sections.append(f"### {short} — No snapshot data")
-            continue
-
-        if device.hostname in mentioned_set:
-            # Full detail for mentioned devices
-            summary = _summarise_snapshot(snap.snapshot_data)
-            features = ", ".join(snap.features_learned or [])
-            snapshot_sections.append(
-                f"### {short} ({device.management_ip}) — DETAILED\n"
-                f"  Features learned: {features}\n"
-                f"  Snapshot taken: {snap.created_at.isoformat()}\n"
-                f"{summary}"
-            )
-        else:
-            # Brief one-liner for others
-            intfs = snap.snapshot_data.get("interface", {})
-            up = sum(1 for d in intfs.values() if isinstance(d, dict) and d.get("oper_status") == "up") if isinstance(intfs, dict) else 0
-            total = len(intfs) if isinstance(intfs, dict) else 0
-            snapshot_sections.append(f"### {short} — {up}/{total} interfaces up")
-
-    snapshot_text = "\n".join(snapshot_sections)
-
-    # Recent findings
-    result = await db.execute(
-        select(Finding.title, Finding.severity, Finding.affected_entity, Finding.category)
-        .order_by(Finding.created_at.desc())
-        .limit(10)
-    )
-    findings = result.all()
-    findings_text = "\n".join(
-        f"  - [{f.severity.upper()}] {f.title} — {f.affected_entity} ({f.category})"
-        for f in findings
-    ) if findings else "  No findings recorded yet."
-
-    return f"""You are Kopis, an AI network operations assistant for a homelab network.
-You are an expert network engineer with deep knowledge of Cisco IOS-XE, IOS-v, NX-OS, BGP, OSPF, spanning-tree, VLANs, and general enterprise networking.
-
-## Your Role
-- Help the operator understand, diagnose, and plan changes to their network
-- Answer questions about device configurations, routing, topology, and best practices
-- Suggest remediation steps for network issues
-- Explain findings and alerts in plain language
-- You have access to real snapshot data from pyATS — use it to give specific, accurate answers
-
-## Network Overview
-This is a homelab network running in GNS3, monitored by the Kopis platform.
-- **Total devices:** {total_devices}
-- **Breakdown:** {', '.join(f'{count} {dtype}s' for dtype, count in type_counts.items())}
-- **Snapshots collected:** {snap_count}
-
-## Device Inventory
-{device_list}
-
-## Snapshot Data
-{snapshot_text}
-
-## Recent Findings (last 10)
-{findings_text}
-
-## Guidelines
-- Be concise and direct — this operator is an experienced network engineer
-- When discussing a device, reference the actual snapshot data above
-- When suggesting commands, use the correct syntax for the device's platform (IOS-XE vs NX-OS)
-- If a device has no snapshot, say so and suggest taking one
-- Format CLI commands in code blocks
-- Never invent data — only reference what's in the snapshots above"""
-
-
-@router.post("")
-async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
-    # Use the latest user message for context-aware prompt building
-    user_message = ""
-    for msg in reversed(req.messages):
-        if msg.get("role") == "user":
-            user_message = msg.get("content", "")
-            break
-
-    system = await _build_system_prompt(db, user_message)
-    model = req.model or settings.haiku_model
-
-    payload = {
-        "model": model,
-        "max_tokens": 4096,
-        "temperature": 0.3,
-        "system": system,
-        "messages": req.messages,
-        "stream": True,
-    }
+async def _anthropic_call(payload: dict) -> dict:
+    """One non-streaming Anthropic call. Used for tool-use turns."""
     headers = {
         "x-api-key": settings.anthropic_api_key,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(ANTHROPIC_API_URL, headers=headers, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+
+async def _anthropic_stream(payload: dict, sse_emit):
+    """Final streaming Anthropic call — pushes text deltas to the SSE channel."""
+    headers = {
+        "x-api-key": settings.anthropic_api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        async with client.stream("POST", ANTHROPIC_API_URL, headers=headers, json=payload) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        await sse_emit({"type": "text", "text": delta["text"]})
+
+
+@router.post("")
+async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
+    model = req.model or settings.haiku_model
+    messages = list(req.messages)
+
+    # We don't pre-inject device data anymore — Claude calls list_devices
+    # if it needs the inventory. That keeps trivial chats cheap.
+    system = SSE_TERMINATOR = None
+    system = SYSTEM_PROMPT
 
     async def generate():
-        async with httpx.AsyncClient(timeout=120) as client:
-            async with client.stream(
-                "POST", ANTHROPIC_API_URL, headers=headers, json=payload
-            ) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:]
-                    if data == "[DONE]":
-                        break
-                    try:
-                        event = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
+        # Inline async queue so we can fan out events from the tool loop
+        # AND from the final streaming call into one SSE response.
+        import asyncio
+        queue: asyncio.Queue = asyncio.Queue()
 
-                    etype = event.get("type")
-                    if etype == "content_block_delta":
-                        delta = event.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            yield f"data: {json.dumps({'text': delta['text']})}\n\n"
-                    elif etype == "message_stop":
-                        yield "data: [DONE]\n\n"
+        async def emit(event: dict):
+            await queue.put(event)
+
+        async def producer():
+            try:
+                # ── Agentic loop ─────────────────────────────────────
+                # Cap iterations to avoid runaway loops if Claude keeps
+                # calling tools without converging. 8 is generous —
+                # most real questions need 1–3 tool calls.
+                for _ in range(8):
+                    payload = {
+                        "model": model,
+                        "max_tokens": 4096,
+                        "temperature": 0.3,
+                        "system": system,
+                        "tools": TOOLS,
+                        "messages": messages,
+                    }
+                    result = await _anthropic_call(payload)
+                    stop_reason = result.get("stop_reason")
+                    content_blocks = result.get("content", [])
+
+                    if stop_reason == "tool_use":
+                        # Append the assistant turn (with the tool_use blocks) to history
+                        messages.append({"role": "assistant", "content": content_blocks})
+
+                        # Execute each tool_use block, build the tool_result reply
+                        tool_results = []
+                        for block in content_blocks:
+                            if block.get("type") != "tool_use":
+                                continue
+                            name = block.get("name", "")
+                            args = block.get("input", {}) or {}
+                            tool_id = block.get("id", "")
+                            await emit({"type": "tool_use", "name": name, "input": args})
+
+                            output = await execute_tool(db, name, args)
+                            await emit({
+                                "type": "tool_result",
+                                "name": name,
+                                "preview": _truncate(output),
+                            })
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tool_id,
+                                "content": output,
+                            })
+
+                        messages.append({"role": "user", "content": tool_results})
+                        continue  # loop back for the next turn
+
+                    # ── No more tool calls — final answer ─────────────
+                    # Re-issue as streaming so the user sees text as it's
+                    # generated. The non-streaming call we just made is
+                    # discarded (its content is already in `content_blocks`
+                    # but we want token-by-token feel for the operator).
+                    # OPTIMISATION: skip the re-call if there's no text
+                    # content — sometimes the model returns just a tool
+                    # rejection or an empty content block.
+                    has_text = any(b.get("type") == "text" and b.get("text") for b in content_blocks)
+                    if not has_text:
+                        await emit({"type": "text", "text": "(no response)"})
+                        break
+
+                    # Stream the final answer fresh
+                    stream_payload = {
+                        "model": model,
+                        "max_tokens": 4096,
+                        "temperature": 0.3,
+                        "system": system,
+                        "tools": TOOLS,
+                        "messages": messages,
+                        "stream": True,
+                    }
+                    await _anthropic_stream(stream_payload, emit)
+                    break
+                else:
+                    await emit({"type": "text", "text": "(tool loop hit cap — stopping)"})
+            except httpx.HTTPStatusError as e:
+                await emit({"type": "text", "text": f"\n\n[chat error: {e.response.status_code} {e.response.text[:200]}]"})
+            except Exception as e:
+                log.exception("chat_loop_failed")
+                await emit({"type": "text", "text": f"\n\n[chat error: {e}]"})
+            finally:
+                await queue.put(None)  # sentinel
+
+        producer_task = asyncio.create_task(producer())
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+            yield "data: [DONE]\n\n"
+        finally:
+            if not producer_task.done():
+                producer_task.cancel()
 
     return StreamingResponse(generate(), media_type="text/event-stream")
