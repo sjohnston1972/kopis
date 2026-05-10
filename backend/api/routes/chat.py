@@ -122,10 +122,30 @@ async def _anthropic_stream(payload: dict, sse_emit):
                         await sse_emit({"type": "text", "text": delta["text"]})
 
 
+def _normalise_messages(raw: list[dict]) -> list[dict]:
+    """Anthropic's Messages API rejects any extra keys beyond {role, content}.
+    The chat UI carries UI-only fields (e.g. toolCalls) on its message
+    objects; clients may also send other metadata. Strip everything that
+    isn't part of the wire schema before the loop forwards them.
+    """
+    cleaned = []
+    for m in raw:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role not in ("user", "assistant"):
+            continue
+        if content is None:
+            continue
+        cleaned.append({"role": role, "content": content})
+    return cleaned
+
+
 @router.post("")
 async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
     model = req.model or settings.haiku_model
-    messages = list(req.messages)
+    messages = _normalise_messages(req.messages)
 
     # We don't pre-inject device data anymore — Claude calls list_devices
     # if it needs the inventory. That keeps trivial chats cheap.

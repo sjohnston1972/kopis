@@ -105,10 +105,14 @@ export default function ChatPanel({ state, onStateChange }) {
     const assistantIdx = next.length;
     setMessages((prev) => [...prev, { role: 'assistant', content: '', toolCalls: [] }]);
 
+    // Anthropic's Messages API only accepts {role, content} on each entry.
+    // Strip our UI-only fields (toolCalls, etc.) before sending the history.
+    const wireMessages = next.map(({ role, content }) => ({ role, content }));
+
     try {
       const controller = new AbortController();
       abortRef.current = controller;
-      const resp = await api.chatStream(next, model);
+      const resp = await api.chatStream(wireMessages, model);
 
       if (!resp.ok) {
         const err = await resp.text();
