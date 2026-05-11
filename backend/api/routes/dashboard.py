@@ -173,13 +173,41 @@ async def dashboard_metrics(db: AsyncSession = Depends(get_db)):
     latest_ids = {row[1]: row[0] for row in latest_snap_q.all()}
 
     all_findings_q = await db.execute(
-        select(Finding.severity, Finding.device_id, Finding.snapshot_id)
+        select(Finding.severity, Finding.category, Finding.title,
+               Finding.device_id, Finding.snapshot_id, Finding.affected_entity)
     )
     finding_counts: dict[str, int] = {}
-    for sev, dev_id, snap_id in all_findings_q.all():
+    finding_categories: dict[str, int] = {}
+    # Per-tile counts: which finding categories should make which tile
+    # show a "needs attention" badge. We don't have explicit "routes
+    # affected" or "ARP entries lost" metrics in the snapshot data —
+    # they're consequences of routing-category findings. Surface those
+    # finding counts on the Routes/ARP tiles so the dashboard reflects
+    # the cascade visually, not just on Interfaces/BGP.
+    routing_affected = 0
+    arp_explicit = 0          # findings that *literally* mention ARP
+    interface_affected = 0
+    for sev, cat, title, dev_id, snap_id, aff in all_findings_q.all():
         if latest_ids.get(dev_id) != snap_id:
             continue  # stale — issue resolved
         finding_counts[sev] = finding_counts.get(sev, 0) + 1
+        cat_l = (cat or "").lower()
+        finding_categories[cat_l] = finding_categories.get(cat_l, 0) + 1
+        t_l = (title or "").lower() + " " + (aff or "").lower()
+        if cat_l == "routing":
+            routing_affected += 1
+        if "arp" in t_l:
+            arp_explicit += 1
+        if cat_l == "interface":
+            interface_affected += 1
+
+    # ARP entries live on interfaces; an interface going down or a
+    # routing disruption usually wipes ARP entries downstream of the
+    # break. Surface a badge if we have either an explicit ARP finding
+    # OR any routing/interface finding — the operator should see the
+    # ARP plane is being touched, even if Haiku didn't write an
+    # ARP-specific finding for it.
+    arp_affected = arp_explicit or routing_affected or interface_affected
 
     return {
         "devices": {
@@ -201,7 +229,15 @@ async def dashboard_metrics(db: AsyncSession = Depends(get_db)):
             "routes": total_routes,
             "vlans": total_vlans,
             "arp_entries": total_arp,
+            # Counts of currently-active findings that touch each tile's
+            # subject. Frontend uses these to render "N affected" badges
+            # on the Routes / ARP tiles, mirroring the existing "N down"
+            # badges on the Interfaces / BGP tiles.
+            "routes_affected": routing_affected,
+            "arp_affected": arp_affected,
+            "interface_affected": interface_affected,
         },
         "findings": finding_counts,
+        "findings_by_category": finding_categories,
         "device_summaries": device_summaries,
     }

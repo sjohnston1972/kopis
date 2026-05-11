@@ -277,6 +277,11 @@ export default function Dashboard() {
   const bgpTotal = m.bgp?.total || 0;
   const totalRoutes = m.routing?.routes || 0;
   const totalArp = m.routing?.arp_entries || 0;
+  // Active findings that touch each tile's subject — drive the "N affected"
+  // badges on the Routes / ARP tiles so they react to a cascade the same
+  // way the Interfaces / BGP tiles do.
+  const routesAffected = m.routing?.routes_affected || 0;
+  const arpAffected = m.routing?.arp_affected || 0;
 
   // Global connectivity = weighted average of BGP + interface health
   const hasBgp = bgpTotal > 0;
@@ -425,6 +430,8 @@ export default function Dashboard() {
                   ? 'No routes learned'
                   : `across ${snappedDevices}/${totalDevices} devices`
               }
+              change={routesAffected > 0 ? `${routesAffected} affected` : undefined}
+              positive={false}
             />
             <MetricCard
               icon="dns"
@@ -435,6 +442,8 @@ export default function Dashboard() {
                   ? 'No ARP data'
                   : `across ${snappedDevices}/${totalDevices} devices`
               }
+              change={arpAffected > 0 ? `${arpAffected} affected` : undefined}
+              positive={false}
             />
             <MetricCard
               icon="verified_user"
