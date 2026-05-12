@@ -4,14 +4,15 @@ Only executes commands from APPROVED recommendations. Captures output,
 updates approval status, and triggers a verification snapshot.
 """
 
+import asyncio
 import time
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
-from db.tables import Approval, Device, Finding, Recommendation
+from db.tables import Approval, Device, Finding, Recommendation, Snapshot
 from services import approval_service
 from services.activity import activity_bus
 
@@ -165,15 +166,20 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
         approval, "executed" if success else "failed"
     )
 
-    # Trigger verification snapshot for the fixed device AND all other
-    # devices in the same incident. The fix on Device A typically resolves
-    # cascading findings on devices B–N (e.g. route withdrawals heal once
-    # the link comes back up). Re-snapshotting them all surfaces the fix
-    # in the dashboard / clears stale findings via the carry-forward
-    # dedup. Without this, downstream devices' findings linger as
-    # "active" until the next scheduled snapshot.
+    # Three-phase verification:
+    #   1. Immediately re-snapshot the FIXED device — confirms the fix
+    #      took on the device we actually touched.
+    #   2. Wait CONVERGENCE_DELAY (BGP/routing needs time to propagate)
+    #      then snapshot every OTHER device that had a finding in the
+    #      incident. Without this delay, the verification snapshot can
+    #      outrun BGP and capture a still-broken downstream state — the
+    #      finding stays "active" even though the network has recovered.
+    #   3. If any findings on incident devices are still flagged active,
+    #      sleep again and re-snapshot ONLY those devices. One retry
+    #      catches the slow-convergers (S4-S1, the far end of the fabric).
+    CONVERGENCE_DELAY = 30  # seconds — typical BGP keepalive + reconvergence
+    RETRY_DELAY = 30        # seconds — for stragglers after the first pass
     if success:
-        # Find every device that had a finding in this incident
         verify_device_ids: set[str] = {device.id}
         if finding.incident_id:
             inc_result = await db.execute(
@@ -184,22 +190,26 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
         verify_devices_q = await db.execute(
             select(Device).where(Device.id.in_(verify_device_ids))
         )
-        verify_devices = list(verify_devices_q.scalars().all())
+        all_verify = list(verify_devices_q.scalars().all())
+        fixed_device = next((d for d in all_verify if d.id == device.id), None)
+        downstream = [d for d in all_verify if d.id != device.id]
 
         snap_act_id = activity_bus.start(
             pipeline_run=f"verify:{approval_id}",
             node="verification",
             model="pyats",
             device=device.hostname,
-            detail=f"Verification snapshot of {len(verify_devices)} incident device(s)",
+            detail=f"3-phase verify of {len(all_verify)} device(s) — fixed device first, then downstream after {CONVERGENCE_DELAY}s wait",
         )
         try:
             from agents.graph import run_pipeline
             from services.snapshot_engine import get_snapshot_diff, take_snapshot
 
-            for vdev in verify_devices:
-                log.info("verification_snapshot_start", hostname=vdev.hostname)
-                new_snaps = await take_snapshot(db, device_id=vdev.id, triggered_by="post-execution-verify")
+            async def _verify_one(vdev: Device, phase: str) -> None:
+                log.info("verification_snapshot_start", hostname=vdev.hostname, phase=phase)
+                new_snaps = await take_snapshot(
+                    db, device_id=vdev.id, triggered_by=f"post-execution-{phase}"
+                )
                 for snap in new_snaps:
                     try:
                         diff_result = await get_snapshot_diff(db, snap.id)
@@ -212,13 +222,89 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
                             device_platform=vdev.platform,
                             raw_snapshot=snap.snapshot_data,
                             snapshot_diff=snapshot_diff,
-                            create_approvals=False,  # don't generate new approvals on verify
+                            create_approvals=False,
                             defer_remediation=True,
                         )
                     except Exception as pipe_err:
-                        log.error("verification_pipeline_failed", hostname=vdev.hostname, error=str(pipe_err))
+                        log.error(
+                            "verification_pipeline_failed",
+                            hostname=vdev.hostname, error=str(pipe_err),
+                        )
 
-            activity_bus.complete(snap_act_id, detail=f"Verified {len(verify_devices)} device(s)")
+            # Phase 1: re-snapshot the fixed device immediately
+            if fixed_device:
+                await _verify_one(fixed_device, phase="fixed-device")
+
+            # Phase 2: let routing/BGP converge, then sample downstream
+            if downstream:
+                log.info("verification_convergence_wait", seconds=CONVERGENCE_DELAY)
+                await asyncio.sleep(CONVERGENCE_DELAY)
+                for vdev in downstream:
+                    await _verify_one(vdev, phase="downstream")
+
+            # Phase 3: any incident finding still pinned to the latest
+            # snapshot is a real residual symptom. Retry once after
+            # another short wait — almost always resolves slow-convergers.
+            from sqlalchemy import select as sa_select
+            if finding.incident_id:
+                # Build per-device latest snapshot_id map
+                latest_sq = (
+                    sa_select(Snapshot.device_id, func.max(Snapshot.created_at).label("max_ts"))
+                    .where(func.array_length(Snapshot.features_learned, 1) > 0)
+                    .group_by(Snapshot.device_id)
+                    .subquery()
+                )
+                latest_q = await db.execute(
+                    sa_select(Snapshot.id, Snapshot.device_id)
+                    .join(
+                        latest_sq,
+                        (Snapshot.device_id == latest_sq.c.device_id)
+                        & (Snapshot.created_at == latest_sq.c.max_ts),
+                    )
+                )
+                latest_per_dev = {row[1]: row[0] for row in latest_q.all()}
+
+                still_q = await db.execute(
+                    sa_select(Finding.device_id)
+                    .where(Finding.incident_id == finding.incident_id)
+                )
+                stragglers = []
+                for row in still_q.all():
+                    dev_id = row[0]
+                    # We only need to retry devices whose latest snapshot
+                    # *also* has an active finding for this incident
+                    f_check = await db.execute(
+                        sa_select(Finding)
+                        .where(Finding.incident_id == finding.incident_id)
+                        .where(Finding.device_id == dev_id)
+                    )
+                    for f in f_check.scalars().all():
+                        if latest_per_dev.get(dev_id) == f.snapshot_id:
+                            stragglers.append(dev_id)
+                            break
+
+                straggler_devs_q = await db.execute(
+                    sa_select(Device).where(Device.id.in_(set(stragglers)))
+                )
+                straggler_devs = list(straggler_devs_q.scalars().all())
+                # Don't re-verify the device we just remediated — it's
+                # been sampled twice already.
+                straggler_devs = [d for d in straggler_devs if d.id != device.id]
+
+                if straggler_devs:
+                    log.info(
+                        "verification_retry_wait",
+                        stragglers=[d.hostname for d in straggler_devs],
+                        seconds=RETRY_DELAY,
+                    )
+                    await asyncio.sleep(RETRY_DELAY)
+                    for vdev in straggler_devs:
+                        await _verify_one(vdev, phase="retry")
+
+            activity_bus.complete(
+                snap_act_id,
+                detail=f"Verified {len(all_verify)} device(s) over 3 phases",
+            )
         except Exception as e:
             log.warning("verification_snapshot_failed", error=str(e))
             activity_bus.fail(snap_act_id, f"Verification snapshot failed: {e}")
