@@ -153,14 +153,19 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
         comment_parts.append(
             f"\n*Command Outputs:*\n{{code}}\n{_format_outputs(result)}\n{{code}}"
         )
-        if rec.rollback_commands:
+        if not success:
+            # Rollback status must be impossible to miss on a failed
+            # execution — this is what tells an operator whether the
+            # device self-healed or needs a human right now.
+            comment_parts.append(f"\n{_format_rollback_status_jira(result)}")
+        elif rec.rollback_commands:
             rb_list = rec.rollback_commands
             if isinstance(rb_list[0], str):
                 rb_text = "\n".join(f"  {c}" for c in rb_list)
             else:
                 rb_text = str(rb_list)
             comment_parts.append(
-                f"\n*Rollback Commands (if needed):*\n{{code}}\n{rb_text}\n{{code}}"
+                f"\n*Rollback Commands (pre-staged, not needed):*\n{{code}}\n{rb_text}\n{{code}}"
             )
 
         comment = "\n".join(comment_parts)
@@ -170,7 +175,7 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
     from integrations.slack import slack_client
 
     await slack_client.notify_approval_update(
-        approval, "executed" if success else "failed"
+        approval, "executed" if success else "failed", result=result if not success else None
     )
 
     # Three-phase verification:
@@ -607,3 +612,33 @@ def _format_outputs(result: dict) -> str:
         if o.get("output"):
             lines.append(f"  {o['output'][:200]}")
     return "\n".join(lines) or "No output"
+
+
+def _format_rollback_status_jira(result: dict) -> str:
+    """Render the rollback outcome for a failed execution as Jira wiki markup.
+
+    Always renders something explicit — a device left half-configured with
+    no rollback attempted must be exactly as visible as a rollback failure,
+    never silently absent from the comment.
+    """
+    rolled_back = result.get("rolled_back", False)
+    reason = result.get("rollback_reason") or "No rollback information recorded."
+    rb_outputs = result.get("rollback_outputs") or []
+
+    if rolled_back:
+        header = "h4. Rollback: SUCCEEDED"
+    elif rb_outputs:
+        # Rollback was attempted (outputs exist) but did not succeed.
+        header = "h4. Rollback: FAILED — MANUAL INTERVENTION REQUIRED"
+    else:
+        header = "h4. Rollback: NOT ATTEMPTED — MANUAL INTERVENTION REQUIRED"
+
+    parts = [header, reason]
+    if rb_outputs:
+        rb_text = "\n".join(
+            f"[{'OK' if o.get('success') else 'FAIL'}] {o.get('command', '?')}\n  {str(o.get('output', ''))[:200]}"
+            for o in rb_outputs
+        )
+        parts.append(f"*Rollback Output:*\n{{code}}\n{rb_text}\n{{code}}")
+
+    return "\n".join(parts)

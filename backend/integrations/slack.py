@@ -22,6 +22,28 @@ RISK_EMOJI = {
 }
 
 
+def _format_rollback_status_slack(result: dict) -> str:
+    """One-glance rollback line for a failed-execution Slack message.
+
+    Mirrors the Jira rollback summary (execution_engine.py) so the same
+    ran/succeeded/failed/none outcome is visible in both places.
+    """
+    rolled_back = result.get("rolled_back", False)
+    rb_outputs = result.get("rollback_outputs") or []
+
+    if rolled_back:
+        return ":leftwards_arrow_with_hook: *Rollback: SUCCEEDED* — device was restored."
+    if rb_outputs:
+        return (
+            ":rotating_light: *Rollback: FAILED — MANUAL INTERVENTION REQUIRED* "
+            "— device is likely left in a partially-configured state."
+        )
+    return (
+        ":rotating_light: *Rollback: NOT ATTEMPTED — MANUAL INTERVENTION REQUIRED* "
+        "— device may be left in a partially-configured state."
+    )
+
+
 class SlackClient:
     def __init__(self) -> None:
         self.webhook_url = settings.slack_webhook_url
@@ -200,8 +222,17 @@ class SlackClient:
 
         return await self._post({"blocks": blocks})
 
-    async def notify_approval_update(self, approval, action: str) -> bool:
-        """Notify that an approval was approved/denied/executed/failed."""
+    async def notify_approval_update(
+        self, approval, action: str, result: dict | None = None
+    ) -> bool:
+        """Notify that an approval was approved/denied/executed/failed.
+
+        `result` is the execution result dict (see execution_engine.py) and
+        is only expected on a `failed` action — it's how a rollback outcome
+        (ran/succeeded/failed/none) reaches Slack at a glance instead of
+        operators having to dig through Jira or the DB to find out whether
+        the device was restored or needs manual attention right now.
+        """
         emoji = {
             "approved": ":white_check_mark:",
             "denied": ":no_entry_sign:",
@@ -217,6 +248,9 @@ class SlackClient:
         )
         if approval.notes:
             text += f"\nNotes: {approval.notes}"
+
+        if action == "failed" and result:
+            text += f"\n{_format_rollback_status_slack(result)}"
 
         return await self._post({"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]})
 
