@@ -6,12 +6,25 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.deps import require_auth
 from db.postgres import get_db, async_session
 from models.approval import ApprovalAction, ApprovalDetail
 from services import approval_service
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
 log = structlog.get_logger()
+
+
+def _resolve_notes(client_claimed_by: str | None, verified_identity: str, notes: str | None) -> str | None:
+    """Never trust a client-supplied `approved_by` as the approver identity
+    (see #9) — the verified identity from require_auth is always what gets
+    persisted as approved_by. If the client sent one anyway, keep it only
+    as a free-text display note, clearly labelled as unverified.
+    """
+    if client_claimed_by and client_claimed_by != verified_identity:
+        note = f"(client-supplied approver claim, not authoritative: {client_claimed_by!r})"
+        return f"{note} {notes}" if notes else note
+    return notes
 
 
 @router.get("", response_model=list[ApprovalDetail])
@@ -25,14 +38,18 @@ async def approve(
     approval_id: str,
     body: ApprovalAction | None = None,
     db: AsyncSession = Depends(get_db),
+    identity: str = Depends(require_auth),
 ):
     body = body or ApprovalAction()
+    # approved_by is ALWAYS the server-verified identity (see #9) — a
+    # client-supplied approved_by is never trusted for the audit trail.
+    notes = _resolve_notes(body.approved_by, identity, body.notes)
     approval = await approval_service.approve(
         db,
         approval_id,
-        approved_by=body.approved_by,
+        approved_by=identity,
         approved_via=body.approved_via or "web",
-        notes=body.notes,
+        notes=notes,
     )
     if not approval:
         raise HTTPException(status_code=404, detail="Approval not found or not pending")
@@ -44,7 +61,7 @@ async def approve(
         await jira_client.transition_issue(
             approval.jira_issue_key,
             status="approved",
-            comment=f"Approved by {body.approved_by or 'unknown'} via {body.approved_via or 'web'}",
+            comment=f"Approved by {identity} via {body.approved_via or 'web'}",
         )
 
     # Notify Slack
@@ -78,14 +95,18 @@ async def deny(
     approval_id: str,
     body: ApprovalAction | None = None,
     db: AsyncSession = Depends(get_db),
+    identity: str = Depends(require_auth),
 ):
     body = body or ApprovalAction()
+    # approved_by is ALWAYS the server-verified identity (see #9) — a
+    # client-supplied approved_by is never trusted for the audit trail.
+    notes = _resolve_notes(body.approved_by, identity, body.notes)
     approval = await approval_service.deny(
         db,
         approval_id,
-        approved_by=body.approved_by,
+        approved_by=identity,
         approved_via=body.approved_via or "web",
-        notes=body.notes,
+        notes=notes,
     )
     if not approval:
         raise HTTPException(status_code=404, detail="Approval not found or not pending")
@@ -96,7 +117,7 @@ async def deny(
         await jira_client.transition_issue(
             approval.jira_issue_key,
             status="denied",
-            comment=f"Denied by {body.approved_by or 'unknown'}: {body.notes or 'No reason given'}",
+            comment=f"Denied by {identity}: {notes or 'No reason given'}",
         )
 
     from integrations.slack import slack_client
