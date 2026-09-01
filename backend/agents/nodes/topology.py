@@ -9,6 +9,7 @@ from pathlib import Path
 
 import structlog
 
+from agents.nodes._llm_guard import llm_result_unusable
 from agents.state import KopisState
 from config import settings
 from integrations.anthropic import anthropic_client
@@ -147,6 +148,22 @@ async def topology_node(state: KopisState) -> dict:
     model = result.pop("_model", settings.haiku_model)
     token_tracking = state.get("tokens_used", {})
     token_tracking[model] = token_tracking.get(model, 0) + tokens
+
+    # Never classify findings from a truncated or unparseable response —
+    # a partial findings list can mark requires_remediation on incomplete
+    # evidence and downstream nodes will act on it (see #18/#19).
+    unusable_reason = llm_result_unusable(result, node="topology", hostname=hostname)
+    if unusable_reason:
+        activity_bus.fail(act_id, f"Haiku classification for {hostname}: {unusable_reason}")
+        return {
+            "findings": [],
+            "escalate_to_opus": False,
+            "processing_stage": "complete",
+            "tokens_used": token_tracking,
+            "errors": state.get("errors", []) + [
+                f"Topology agent: {unusable_reason} for {hostname} — no findings produced"
+            ],
+        }
 
     findings = result.get("findings", [])
     escalate = result.get("escalate_to_opus", False)

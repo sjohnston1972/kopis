@@ -274,6 +274,19 @@ async def run_pipeline(
         if real_finding_id in deduped_finding_ids:
             continue
 
+        # Defense in depth: nodes already refuse to emit recommendations
+        # from truncated/parse-errored LLM responses (#18/#19), but never
+        # persist/approve/ticket one here either if a stray marker or an
+        # empty commands list slips through — a recommendation with no
+        # commands isn't well-formed and must not become an approval.
+        if r.get("_truncated") or r.get("_parse_error") or not r.get("commands"):
+            log.warning(
+                "recommendation_skipped_malformed",
+                finding_id=real_finding_id,
+                reason="truncated/parse-errored or missing commands",
+            )
+            continue
+
         rec_id = str(uuid.uuid4())
         rec = Recommendation(
             id=rec_id,

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import structlog
 
+from agents.nodes._llm_guard import llm_result_unusable
 from agents.state import KopisState
 from config import settings
 from integrations.anthropic import anthropic_client
@@ -69,6 +70,20 @@ async def remediation_node(state: KopisState) -> dict:
     model = result.pop("_model", settings.sonnet_model)
     token_tracking = state.get("tokens_used", {})
     token_tracking[model] = token_tracking.get(model, 0) + tokens
+
+    # Never turn a truncated or unparseable model response into a stored
+    # recommendation — it can be a partial commands list (see #18/#19).
+    unusable_reason = llm_result_unusable(result, node="remediation", hostname=hostname)
+    if unusable_reason:
+        activity_bus.fail(act_id, f"Sonnet remediation for {hostname}: {unusable_reason}")
+        return {
+            "recommendations": [],
+            "processing_stage": "complete",
+            "tokens_used": token_tracking,
+            "errors": state.get("errors", []) + [
+                f"Remediation agent: {unusable_reason} for {hostname} — no recommendations produced"
+            ],
+        }
 
     recommendations = result.get("recommendations", [])
     for r in recommendations:

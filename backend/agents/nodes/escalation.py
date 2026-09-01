@@ -10,6 +10,7 @@ from pathlib import Path
 
 import structlog
 
+from agents.nodes._llm_guard import llm_result_unusable
 from agents.state import KopisState
 from config import settings
 from integrations.anthropic import anthropic_client
@@ -62,6 +63,23 @@ async def escalation_node(state: KopisState) -> dict:
     model = result.pop("_model", settings.opus_model)
     token_tracking = state.get("tokens_used", {})
     token_tracking[model] = token_tracking.get(model, 0) + tokens
+
+    # Never accept updated findings/recommendations from a truncated or
+    # unparseable response — fall back to the pre-escalation findings and
+    # produce zero recommendations rather than guess (see #18/#19).
+    unusable_reason = llm_result_unusable(result, node="escalation", hostname=hostname)
+    if unusable_reason:
+        activity_bus.fail(act_id, f"Opus escalation for {hostname}: {unusable_reason}")
+        return {
+            "findings": state.get("findings", []),
+            "recommendations": [],
+            "escalate_to_opus": False,
+            "processing_stage": "complete",
+            "tokens_used": token_tracking,
+            "errors": state.get("errors", []) + [
+                f"Escalation agent: {unusable_reason} for {hostname} — no updated findings/recommendations produced"
+            ],
+        }
 
     # Opus may return updated findings and/or direct recommendations
     updated_findings = result.get("findings", state.get("findings", []))

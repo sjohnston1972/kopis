@@ -14,6 +14,7 @@ from pathlib import Path
 
 import structlog
 
+from agents.nodes._llm_guard import llm_result_unusable
 from agents.state import KopisState
 from config import settings
 from integrations.anthropic import anthropic_client
@@ -80,6 +81,21 @@ async def escalation_remediation_node(state: KopisState) -> dict:
     model = result.pop("_model", settings.opus_model)
     token_tracking = state.get("tokens_used", {})
     token_tracking[model] = token_tracking.get(model, 0) + tokens
+
+    # Never store recommendations from a truncated or unparseable response
+    # (see #18/#19). Standard-tier findings still route onward so the
+    # Sonnet remediation node gets a chance at them.
+    unusable_reason = llm_result_unusable(result, node="escalation_remediation", hostname=hostname)
+    if unusable_reason:
+        activity_bus.fail(act_id, f"Opus complex remediation for {hostname}: {unusable_reason}")
+        return {
+            "recommendations": [],
+            "processing_stage": "remediation" if standard else "complete",
+            "tokens_used": token_tracking,
+            "errors": state.get("errors", []) + [
+                f"Escalation remediation agent: {unusable_reason} for {hostname} — no recommendations produced"
+            ],
+        }
 
     recommendations = result.get("recommendations", [])
     for r in recommendations:
