@@ -223,7 +223,7 @@ APPROVAL_EXPIRY_HOURS=24
 
 ## API
 
-21 endpoints, all under `http://localhost:8200/api/v1/`. Full OpenAPI at `/docs`.
+22 endpoints, all under `http://localhost:8200/api/v1/`. Full OpenAPI at `/docs`.
 
 ### Devices
 | Method | Endpoint | Purpose |
@@ -258,6 +258,13 @@ APPROVAL_EXPIRY_HOURS=24
 | `GET` | `/approvals/history` | Executed history |
 | `POST` | `/approvals/expire` | Manually expire stale approvals past TTL |
 | `POST` | `/execute` / `/execute/{id}` | Execute an approved remediation |
+
+### Slack
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/slack/actions` | Slack Interactivity Request URL — Approve/Deny button clicks. Verifies `X-Slack-Signature`/`X-Slack-Request-Timestamp` against `SLACK_SIGNING_SECRET` (HMAC-SHA256, 5 min replay window, fails closed if unset) and calls the same `approval_service.approve`/`deny` the web UI uses. |
+
+To enable the buttons, the Slack app needs a bot token (`chat:write`) so `notify_new_approval` messages carry working interactive elements, and **Interactivity** turned on with the Request URL set to `https://<your-host>/api/v1/slack/actions`. `SLACK_SIGNING_SECRET` (Slack app → *Basic Information* → *Signing Secret*) must be set for the endpoint to accept anything — with it unset, every callback is rejected rather than silently unverified.
 
 ### Topology & Health
 | Method | Endpoint | Purpose |
