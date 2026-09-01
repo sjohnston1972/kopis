@@ -62,6 +62,13 @@ class Settings(BaseSettings):
     def cors_allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_allowed_origins.split(",") if o.strip()]
 
+    # ── Execution safety ─────────────────────────────────────
+    # When a config apply fails partway through, automatically execute the
+    # recommendation's stored rollback commands on the same device session.
+    # Disable (AUTO_ROLLBACK=false) if operators prefer to freeze a
+    # half-applied device for manual inspection instead.
+    auto_rollback: bool = True
+
     @property
     def database_url(self) -> str:
         return (

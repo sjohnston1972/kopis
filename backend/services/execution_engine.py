@@ -95,6 +95,11 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
     if isinstance(commands[0], dict):
         commands = [c.get("command", str(c)) for c in commands]
 
+    # Flatten rollback commands the same way (dict/str shapes from JSON).
+    rollback_commands = rec.rollback_commands or []
+    if rollback_commands and isinstance(rollback_commands[0], dict):
+        rollback_commands = [c.get("command", str(c)) for c in rollback_commands]
+
     log.info(
         "execution_start",
         approval_id=approval_id,
@@ -112,7 +117,9 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
 
     # Execute via pyATS/Netmiko (blocking — run in thread)
     import asyncio
-    result = await asyncio.to_thread(_send_commands_sync, device, commands)
+    result = await asyncio.to_thread(
+        _send_commands_sync, device, commands, rollback_commands
+    )
 
     # Update approval record
     success = not result.get("error")
@@ -409,7 +416,39 @@ def _classify_commands(commands: list[str]) -> tuple[list[str], list[str]]:
     return exec_cmds, cfg_cmds
 
 
-def _send_commands_sync(device, commands: list[str]) -> dict:
+def _run_rollback(tb_device, rollback_commands: list[str]) -> tuple[list[dict], bool, str | None]:
+    """Execute stored rollback commands on the still-open device connection.
+
+    Called only after a forward config apply has already failed partway
+    through, so this is the last line of defense against leaving the
+    device in a partially-changed state. Returns (outputs, success, error).
+    A failure here is serious — the device may now be in an unknown,
+    partially-configured state that needs a human to look at immediately.
+    """
+    rb_outputs: list[dict] = []
+    _, rb_cfg = _classify_commands(rollback_commands)
+    cmds_to_run = rb_cfg or rollback_commands
+
+    try:
+        output = tb_device.configure(cmds_to_run, timeout=settings.pyats_command_timeout)
+        rb_outputs.append({
+            "command": "rollback configure { " + "; ".join(cmds_to_run) + " }",
+            "output": output if isinstance(output, str) else str(output),
+            "success": True,
+        })
+        return rb_outputs, True, None
+    except Exception as e:
+        rb_outputs.append({
+            "command": "rollback configure { " + "; ".join(cmds_to_run) + " }",
+            "output": str(e),
+            "success": False,
+        })
+        return rb_outputs, False, str(e)
+
+
+def _send_commands_sync(
+    device, commands: list[str], rollback_commands: list[str] | None = None
+) -> dict:
     """Connect to a device and send commands (blocking — run via asyncio.to_thread).
 
     Splits commands into exec vs config groups; uses tb_device.execute() for
@@ -417,6 +456,12 @@ def _send_commands_sync(device, commands: list[str]) -> dict:
     handles 'configure terminal' / 'end' transitions internally — feeding it
     those tokens (or running config commands through execute()) puts the
     session into the wrong state and every subsequent command fails.
+
+    If the config-apply block fails partway through and `rollback_commands`
+    are supplied, and AUTO_ROLLBACK is enabled, the stored rollback commands
+    are executed on the SAME open connection before disconnecting. The
+    result always carries an explicit `rolled_back` + `rollback_reason` so a
+    "no rollback happened" outcome is reported, never silently swallowed.
     """
     from services.testbed_generator import generate_testbed
 
@@ -424,6 +469,12 @@ def _send_commands_sync(device, commands: list[str]) -> dict:
     start = time.time()
 
     exec_cmds, cfg_cmds = _classify_commands(commands)
+
+    rollback_info: dict = {
+        "rolled_back": False,
+        "rollback_reason": None,
+        "rollback_outputs": [],
+    }
 
     try:
         from genie.testbed import load as load_testbed
@@ -469,6 +520,60 @@ def _send_commands_sync(device, commands: list[str]) -> dict:
                     "success": False,
                 })
 
+                # Config apply failed partway through — the device may now
+                # be half-changed. Execute the stored rollback on this same
+                # connection rather than just logging the failure and
+                # walking away.
+                if rollback_commands and settings.auto_rollback:
+                    log.warning(
+                        "rollback_attempt_start",
+                        hostname=device.hostname,
+                        rollback_command_count=len(rollback_commands),
+                    )
+                    rb_outputs, rb_success, rb_error = _run_rollback(
+                        tb_device, rollback_commands
+                    )
+                    rollback_info["rollback_outputs"] = rb_outputs
+                    rollback_info["rolled_back"] = rb_success
+                    if rb_success:
+                        rollback_info["rollback_reason"] = (
+                            "Config apply failed; stored rollback commands were "
+                            "executed successfully on the same session."
+                        )
+                        log.warning("rollback_succeeded", hostname=device.hostname)
+                    else:
+                        rollback_info["rollback_reason"] = (
+                            f"Config apply failed AND the rollback itself failed "
+                            f"({rb_error}). Device {device.hostname} is likely left "
+                            f"in a partially-configured state — MANUAL INTERVENTION "
+                            f"REQUIRED NOW."
+                        )
+                        log.error(
+                            "rollback_failed",
+                            hostname=device.hostname,
+                            error=rb_error,
+                        )
+                elif rollback_commands and not settings.auto_rollback:
+                    rollback_info["rollback_reason"] = (
+                        "Config apply failed. Rollback commands exist but "
+                        "AUTO_ROLLBACK is disabled, so they were NOT executed — "
+                        f"device {device.hostname} may be left in a "
+                        "partially-configured state; manual review required."
+                    )
+                    log.warning(
+                        "rollback_skipped_disabled", hostname=device.hostname
+                    )
+                else:
+                    rollback_info["rollback_reason"] = (
+                        "Config apply failed and no rollback commands were "
+                        f"available for this recommendation — device "
+                        f"{device.hostname} may be left in a partially-configured "
+                        "state; manual review required."
+                    )
+                    log.warning(
+                        "rollback_unavailable", hostname=device.hostname
+                    )
+
         try:
             tb_device.disconnect()
         except Exception:
@@ -488,6 +593,7 @@ def _send_commands_sync(device, commands: list[str]) -> dict:
         "outputs": outputs,
         "duration_seconds": duration,
         "success": all_success,
+        **rollback_info,
         **({"error": "One or more commands failed"} if not all_success else {}),
     }
 
