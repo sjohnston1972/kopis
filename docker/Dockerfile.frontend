@@ -4,6 +4,10 @@ WORKDIR /app
 COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend/ ./
+# Shared API credential baked into the static build — must match the
+# backend's API_AUTH_TOKEN (see backend/api/deps.py, frontend/src/api/client.js).
+ARG VITE_API_TOKEN
+ENV VITE_API_TOKEN=${VITE_API_TOKEN}
 RUN npm run build
 
 # Stage 2: Serve

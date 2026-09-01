@@ -1,8 +1,18 @@
 const API_BASE = '/api/v1';
 
+// Shared API credential (see backend/api/deps.py::require_auth). Kopis uses
+// a single shared token for this iteration — set at build time via
+// VITE_API_TOKEN, matching the backend's API_AUTH_TOKEN. Every endpoint
+// except /health requires it; requests without it will get a 401.
+const API_TOKEN = import.meta.env.VITE_API_TOKEN || '';
+
+function authHeaders() {
+  return API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {};
+}
+
 async function request(path, options = {}) {
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
+    headers: { 'Content-Type': 'application/json', ...authHeaders(), ...options.headers },
     ...options,
   });
   if (!res.ok) {
@@ -89,7 +99,7 @@ export const api = {
   pipelineActivity: () => request('/pipeline/activity'),
   pipelineActivityStream: () =>
     fetch(`${API_BASE}/pipeline/activity/stream`, {
-      headers: { 'Accept': 'text/event-stream' },
+      headers: { 'Accept': 'text/event-stream', ...authHeaders() },
     }),
 
   // Execution
@@ -99,7 +109,7 @@ export const api = {
   chatStream: (messages, model) =>
     fetch(`${API_BASE}/chat`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ messages, model }),
     }),
 

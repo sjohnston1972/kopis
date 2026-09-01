@@ -5,9 +5,10 @@ import sys
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.deps import require_auth
 from api.routes import approvals, chat, dashboard, devices, execution, findings, health, pipeline, schedules, slack, snapshots, topology
 from config import settings
 from db.postgres import engine
@@ -114,15 +115,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(health.router, prefix="/api/v1")
-app.include_router(dashboard.router, prefix="/api/v1")
-app.include_router(devices.router, prefix="/api/v1")
-app.include_router(snapshots.router, prefix="/api/v1")
-app.include_router(findings.router, prefix="/api/v1")
-app.include_router(approvals.router, prefix="/api/v1")
-app.include_router(topology.router, prefix="/api/v1")
-app.include_router(chat.router, prefix="/api/v1")
-app.include_router(pipeline.router, prefix="/api/v1")
-app.include_router(execution.router, prefix="/api/v1")
-app.include_router(schedules.router, prefix="/api/v1")
+# `health` is the only router left unauthenticated — it's what the frontend
+# (and Docker healthchecks) poll pre-login, and it exposes no network state
+# or control surface. Every other router pushes or reveals live network
+# data / control, so require_auth is applied to all of them at the
+# router level (i.e. every method on every route in that router).
+#
+# NOTE for the Slack integration work (#13-#15): do not add
+# `Depends(require_auth)` to a future `/slack/*` router — Slack requests
+# are authenticated by Slack request-signature verification instead, not
+# this bearer/X-API-Key token.
+_auth_dep = [Depends(require_auth)]
+
+app.include_router(dashboard.router, prefix="/api/v1", dependencies=_auth_dep)
+app.include_router(devices.router, prefix="/api/v1", dependencies=_auth_dep)
+app.include_router(snapshots.router, prefix="/api/v1", dependencies=_auth_dep)
+app.include_router(findings.router, prefix="/api/v1", dependencies=_auth_dep)
+app.include_router(approvals.router, prefix="/api/v1", dependencies=_auth_dep)
+app.include_router(topology.router, prefix="/api/v1", dependencies=_auth_dep)
+app.include_router(chat.router, prefix="/api/v1", dependencies=_auth_dep)
+app.include_router(pipeline.router, prefix="/api/v1", dependencies=_auth_dep)
+app.include_router(execution.router, prefix="/api/v1", dependencies=_auth_dep)
+app.include_router(schedules.router, prefix="/api/v1", dependencies=_auth_dep)
+# NOTE: slack router intentionally NOT protected by require_auth — Slack
+# requests are authenticated by Slack request-signature verification
+# instead (see #13-#15).
 app.include_router(slack.router, prefix="/api/v1")

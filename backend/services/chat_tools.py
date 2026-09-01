@@ -25,11 +25,23 @@ import structlog
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from config import settings
 from db.tables import Approval, Device, Finding, Recommendation, Snapshot
 
 log = structlog.get_logger()
 
 API_INTERNAL = "http://localhost:8000/api/v1"
+
+
+def _internal_auth_headers() -> dict:
+    """Auth header for the chat tools' internal loopback calls to our own
+    API. Those routers now require Depends(require_auth) (see main.py),
+    so these self-calls need the same shared token the frontend uses —
+    without it every tool call here would 401.
+    """
+    if not settings.api_auth_token:
+        return {}
+    return {"Authorization": f"Bearer {settings.api_auth_token}"}
 
 # Commands we'll forward to a device via pyATS in `run_show_command`.
 # Anything else (config, reload, clear, write, copy, ...) is rejected.
@@ -217,7 +229,7 @@ async def t_list_findings(db: AsyncSession, args: dict) -> str:
 
 
 async def t_list_incidents(db: AsyncSession, _: dict) -> str:
-    async with httpx.AsyncClient(timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15, headers=_internal_auth_headers()) as c:
         r = await c.get(f"{API_INTERNAL}/findings/incidents/list")
         r.raise_for_status()
         incidents = r.json()
@@ -245,7 +257,7 @@ async def t_get_finding(db: AsyncSession, args: dict) -> str:
     fid = args.get("finding_id")
     if not fid:
         return "finding_id required."
-    async with httpx.AsyncClient(timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15, headers=_internal_auth_headers()) as c:
         r = await c.get(f"{API_INTERNAL}/findings/{fid}")
     if r.status_code == 404:
         return f"Finding {fid} not found."
@@ -282,7 +294,7 @@ async def t_get_finding(db: AsyncSession, args: dict) -> str:
 
 
 async def t_list_pending_approvals(db: AsyncSession, _: dict) -> str:
-    async with httpx.AsyncClient(timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15, headers=_internal_auth_headers()) as c:
         r = await c.get(f"{API_INTERNAL}/approvals")
         r.raise_for_status()
         ap = r.json()
@@ -308,7 +320,7 @@ async def t_list_pending_approvals(db: AsyncSession, _: dict) -> str:
 
 async def t_recent_executions(db: AsyncSession, args: dict) -> str:
     limit = int(args.get("limit") or 10)
-    async with httpx.AsyncClient(timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15, headers=_internal_auth_headers()) as c:
         r = await c.get(f"{API_INTERNAL}/approvals/history")
         r.raise_for_status()
         history = r.json()
@@ -330,7 +342,7 @@ async def t_recent_executions(db: AsyncSession, args: dict) -> str:
 
 
 async def t_get_topology(db: AsyncSession, _: dict) -> str:
-    async with httpx.AsyncClient(timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15, headers=_internal_auth_headers()) as c:
         r = await c.get(f"{API_INTERNAL}/topology")
         r.raise_for_status()
         topo = r.json()
@@ -362,7 +374,7 @@ async def t_get_topology(db: AsyncSession, _: dict) -> str:
 
 
 async def t_get_dashboard(db: AsyncSession, _: dict) -> str:
-    async with httpx.AsyncClient(timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15, headers=_internal_auth_headers()) as c:
         r = await c.get(f"{API_INTERNAL}/dashboard/metrics")
         r.raise_for_status()
         m = r.json()
@@ -426,7 +438,7 @@ async def t_trigger_snapshot(db: AsyncSession, args: dict) -> str:
         if not dev:
             return f"Device '{hostname}' not found."
         body["device_id"] = dev.id
-    async with httpx.AsyncClient(timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15, headers=_internal_auth_headers()) as c:
         r = await c.post(f"{API_INTERNAL}/snapshots", json=body)
     if r.status_code >= 400:
         return f"Snapshot trigger failed: HTTP {r.status_code}"

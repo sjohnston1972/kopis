@@ -229,6 +229,22 @@ CORS_ALLOWED_ORIGINS=http://localhost:8201
 
 22 endpoints, all under `http://localhost:8200/api/v1/`. Full OpenAPI at `/docs`.
 
+### Authentication
+
+Every endpoint except `/health` requires an API credential — either
+`Authorization: Bearer <API_AUTH_TOKEN>` or `X-API-Key: <API_AUTH_TOKEN>`.
+This is a **fail-closed** shared-secret model: if `API_AUTH_TOKEN` isn't
+configured, every request is rejected with 401 (there is no "auth
+disabled" mode). The frontend build reads the same secret as
+`VITE_API_TOKEN` (wired through `docker-compose.yml`) and sends it
+automatically. `approved_by` on an approval is always the server-verified
+identity from this credential — a client-supplied `approved_by` is never
+trusted for the audit trail.
+
+```bash
+curl -H "Authorization: Bearer $API_AUTH_TOKEN" http://localhost:8200/api/v1/approvals
+```
+
 ### Devices
 | Method | Endpoint | Purpose |
 |---|---|---|
