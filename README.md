@@ -217,6 +217,10 @@ SLACK_SIGNING_SECRET=
 # Scheduling
 SNAPSHOT_SCHEDULE_CRON=0 */6 * * *
 APPROVAL_EXPIRY_HOURS=24
+
+# API auth (required — see API section below)
+API_AUTH_TOKEN=
+CORS_ALLOWED_ORIGINS=http://localhost:8201
 ```
 
 ---

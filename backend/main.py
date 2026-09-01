@@ -6,8 +6,10 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes import approvals, chat, dashboard, devices, execution, findings, health, pipeline, schedules, slack, snapshots, topology
+from config import settings
 from db.postgres import engine
 from services import scheduler
 
@@ -73,6 +75,15 @@ async def _reset_orphaned_approvals():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("kopis_starting")
+    if not settings.api_auth_token:
+        # Fail-CLOSED by design: an unset token means every non-health
+        # request will be rejected with 401 (see api/deps.py::require_auth),
+        # never treated as "auth disabled". This log exists so the
+        # misconfiguration is impossible to miss on startup.
+        log.error(
+            "api_auth_token_not_configured",
+            message="API_AUTH_TOKEN is not set — all authenticated endpoints will reject every request until it is configured.",
+        )
     await _reset_stale_snapshot_status()
     await _reset_orphaned_approvals()
     # Refresh inventory immediately on startup so devices have fresh
@@ -93,6 +104,14 @@ app = FastAPI(
     description="AI-augmented network operations platform",
     version="0.1.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_allowed_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(health.router, prefix="/api/v1")

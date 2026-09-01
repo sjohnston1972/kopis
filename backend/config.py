@@ -51,6 +51,17 @@ class Settings(BaseSettings):
     approval_expiry_hours: int = 24
     log_level: str = "INFO"
 
+    # ── API Auth / CORS ──────────────────────────────────────
+    # Shared-secret API credential. Required for every non-health request —
+    # there is no "auth disabled" default. See backend/api/deps.py.
+    api_auth_token: str = ""
+    # Comma-separated list of allowed CORS origins (the frontend origin(s)).
+    cors_allowed_origins: str = "http://localhost:8201"
+
+    @property
+    def cors_allowed_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_allowed_origins.split(",") if o.strip()]
+
     @property
     def database_url(self) -> str:
         return (
