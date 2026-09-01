@@ -171,6 +171,33 @@ class SlackClient:
             },
         ]
 
+        action_elements = [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Approve", "emoji": True},
+                "style": "primary",
+                "action_id": "approve_remediation",
+                "value": approval_id,
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Deny", "emoji": True},
+                "style": "danger",
+                "action_id": "deny_remediation",
+                "value": approval_id,
+            },
+        ]
+        if jira_url:
+            action_elements.append(
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "View in Jira", "emoji": True},
+                    "action_id": "view_jira_issue",
+                    "url": jira_url,
+                }
+            )
+        blocks.append({"type": "actions", "block_id": "approval_actions", "elements": action_elements})
+
         return await self._post({"blocks": blocks})
 
     async def notify_approval_update(self, approval, action: str) -> bool:
