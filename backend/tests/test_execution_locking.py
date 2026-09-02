@@ -52,12 +52,15 @@ from services import execution_engine
 def _make_send_commands_mock():
     """A fake pyATS/Netmiko command runner that records every call."""
 
-    def _fake(device, commands):
+    def _fake(device, commands, rollback_commands=None):
         return {
             "hostname": device.hostname,
             "outputs": [{"command": c, "output": "ok", "success": True} for c in commands],
             "duration_seconds": 0.01,
             "success": True,
+            "rolled_back": False,
+            "rollback_reason": None,
+            "rollback_outputs": [],
         }
 
     return Mock(side_effect=_fake)
