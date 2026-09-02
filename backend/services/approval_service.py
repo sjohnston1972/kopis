@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -52,6 +52,39 @@ async def get_approval(db: AsyncSession, approval_id: str) -> Approval | None:
     return result.scalar_one_or_none()
 
 
+async def _atomic_transition(
+    db: AsyncSession,
+    approval_id: str,
+    *,
+    from_status: str,
+    values: dict,
+) -> Approval | None:
+    """Conditionally transition one approval's status with a single UPDATE.
+
+    This is a database-level compare-and-swap: `UPDATE ... WHERE id=:id AND
+    status=:from_status RETURNING *`. Postgres takes a row lock for the
+    UPDATE and re-checks the WHERE predicate under that lock, so when two
+    callers race for the same row, exactly one UPDATE matches — the other's
+    predicate no longer holds once the winner's row lock is released — and
+    its RETURNING clause yields no row. There is no read-then-write gap for
+    a second caller (in this process, another worker thread, or another
+    replica entirely — the guarantee comes from the database, not from any
+    in-process lock or flag) to squeeze into.
+
+    Returns the updated ORM instance if this call won the race, else None.
+    """
+    stmt = (
+        update(Approval)
+        .where(Approval.id == approval_id, Approval.status == from_status)
+        .values(**values)
+        .returning(Approval)
+    )
+    result = await db.execute(stmt)
+    approval = result.scalar_one_or_none()
+    await db.commit()
+    return approval
+
+
 async def approve(
     db: AsyncSession,
     approval_id: str,
@@ -59,17 +92,20 @@ async def approve(
     approved_via: str = "web",
     notes: str | None = None,
 ) -> Approval | None:
-    approval = await get_approval(db, approval_id)
-    if not approval or approval.status != "pending":
+    approval = await _atomic_transition(
+        db,
+        approval_id,
+        from_status="pending",
+        values={
+            "status": "approved",
+            "approved_by": approved_by,
+            "approved_via": approved_via,
+            "approved_at": datetime.now(timezone.utc),
+            "notes": notes,
+        },
+    )
+    if approval is None:
         return None
-
-    approval.status = "approved"
-    approval.approved_by = approved_by
-    approval.approved_via = approved_via
-    approval.approved_at = datetime.now(timezone.utc)
-    approval.notes = notes
-    await db.commit()
-    await db.refresh(approval)
 
     log.info("approval_approved", id=approval_id, by=approved_by, via=approved_via)
     return approval
@@ -82,17 +118,20 @@ async def deny(
     approved_via: str = "web",
     notes: str | None = None,
 ) -> Approval | None:
-    approval = await get_approval(db, approval_id)
-    if not approval or approval.status != "pending":
+    approval = await _atomic_transition(
+        db,
+        approval_id,
+        from_status="pending",
+        values={
+            "status": "denied",
+            "approved_by": approved_by,
+            "approved_via": approved_via,
+            "approved_at": datetime.now(timezone.utc),
+            "notes": notes,
+        },
+    )
+    if approval is None:
         return None
-
-    approval.status = "denied"
-    approval.approved_by = approved_by
-    approval.approved_via = approved_via
-    approval.approved_at = datetime.now(timezone.utc)
-    approval.notes = notes
-    await db.commit()
-    await db.refresh(approval)
 
     log.info("approval_denied", id=approval_id, by=approved_by, via=approved_via)
     return approval
