@@ -523,7 +523,7 @@ async def generate_incident_remediations(
             select(Approval)
             .join(Recommendation, Approval.recommendation_id == Recommendation.id)
             .where(Recommendation.finding_id == root.id)
-            .where(Approval.status.in_(["pending", "approved"]))
+            .where(Approval.status.in_(["pending", "approved", "executing"]))
         )
         if open_q.scalars().first() is not None:
             continue
@@ -655,7 +655,7 @@ async def create_incident_approvals(
         existing_open = await db.execute(
             select(Approval)
             .where(Approval.recommendation_id == rec.id)
-            .where(Approval.status.in_(["pending", "approved"]))
+            .where(Approval.status.in_(["pending", "approved", "executing"]))
         )
         if existing_open.scalars().first() is not None:
             continue

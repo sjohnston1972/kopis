@@ -49,28 +49,20 @@ async def _reset_stale_snapshot_status():
 
 
 async def _reset_orphaned_approvals():
-    """Mark any 'approved' (executing) approvals as failed on startup.
+    """Mark any 'executing' (in-flight) approvals as failed on startup.
 
     If the container restarted while an execution was in-flight, the
-    asyncio.create_task was lost.  These approvals would otherwise be
-    stuck in 'approved' forever.
+    asyncio.create_task was lost. See
+    services.approval_service.reset_orphaned_executing for the full
+    rationale (including why 'approved' rows are deliberately left alone).
     """
     from db.postgres import async_session
-    from db.tables import Approval
-    from sqlalchemy import select
+    from services import approval_service
 
     async with async_session() as db:
-        result = await db.execute(
-            select(Approval).where(Approval.status == "approved")
-        )
-        stuck = result.scalars().all()
-        for a in stuck:
-            a.status = "failed"
-            a.execution_result = {"error": "Execution lost — container restarted before completion"}
-            log.warning("orphaned_approval_reset", approval_id=a.id)
-        if stuck:
-            await db.commit()
-            log.info("orphaned_approvals_fixed", count=len(stuck))
+        count = await approval_service.reset_orphaned_executing(db)
+        if count:
+            log.info("startup_orphan_reset", count=count)
 
 
 @asynccontextmanager

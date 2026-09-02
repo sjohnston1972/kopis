@@ -24,9 +24,24 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
 
     Returns execution result dict with command outputs.
     """
-    approval = await approval_service.get_approval(db, approval_id)
-    if not approval or approval.status != "approved":
-        return {"error": "Approval not found or not in approved state"}
+    # Atomically claim this approval for execution: approved -> executing.
+    # This is a single conditional UPDATE (see approval_service.claim_executing)
+    # so only one caller — whether the approve()-triggered background task or
+    # a concurrent manual /execute call, in this process or another
+    # worker/replica — ever proceeds past this point for a given approval.
+    approval = await approval_service.claim_executing(db, approval_id)
+    if not approval:
+        existing = await approval_service.get_approval(db, approval_id)
+        if not existing:
+            return {"error": "Approval not found"}
+        log.info(
+            "execution_skipped_already_claimed",
+            approval_id=approval_id, status=existing.status,
+        )
+        return {
+            "skipped": True,
+            "reason": f"Already {existing.status} — not executing again",
+        }
 
     # Load recommendation
     rec_result = await db.execute(
@@ -34,6 +49,11 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
     )
     rec = rec_result.scalar_one_or_none()
     if not rec:
+        await approval_service.mark_executed(
+            db, approval_id,
+            {"error": "Recommendation not found", "outputs": []},
+            success=False,
+        )
         return {"error": "Recommendation not found"}
 
     # Load finding -> device
@@ -56,6 +76,11 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
     )
     device = device_result.scalar_one_or_none()
     if not device:
+        await approval_service.mark_executed(
+            db, approval_id,
+            {"error": "Device not found", "outputs": []},
+            success=False,
+        )
         return {"error": "Device not found"}
 
     # Pre-flight sanity check: take a fresh single-device snapshot and
@@ -89,6 +114,11 @@ async def execute_approved(db: AsyncSession, approval_id: str) -> dict:
     # Extract commands
     commands = rec.commands
     if not commands:
+        await approval_service.mark_executed(
+            db, approval_id,
+            {"error": "No commands to execute", "outputs": []},
+            success=False,
+        )
         return {"error": "No commands to execute"}
 
     # Flatten if commands are dicts (from JSON)

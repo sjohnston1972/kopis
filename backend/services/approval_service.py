@@ -25,10 +25,10 @@ async def list_pending(db: AsyncSession) -> list[dict]:
 
 
 async def list_active(db: AsyncSession) -> list[dict]:
-    """List pending + approved (executing) approvals with full context."""
+    """List pending + approved + in-flight (executing) approvals with full context."""
     result = await db.execute(
         select(Approval)
-        .where(Approval.status.in_(["pending", "approved"]))
+        .where(Approval.status.in_(["pending", "approved", "executing"]))
         .order_by(Approval.created_at.desc())
     )
     approvals = result.scalars().all()
@@ -137,21 +137,93 @@ async def deny(
     return approval
 
 
+async def claim_executing(db: AsyncSession, approval_id: str) -> Approval | None:
+    """Atomically claim an approved approval for execution.
+
+    Transitions approved -> executing via the same conditional-UPDATE
+    pattern as approve()/deny(). Only the caller whose UPDATE actually
+    matches a row (rowcount 1, surfaced here as a non-None return) may
+    proceed to run device commands. A concurrent caller — whether it's the
+    approve()-triggered background task or a manual /execute call, racing
+    in this process or from a different worker/replica — gets None and
+    must not touch the device.
+    """
+    approval = await _atomic_transition(
+        db,
+        approval_id,
+        from_status="approved",
+        values={"status": "executing"},
+    )
+    if approval is not None:
+        log.info("execution_claimed", id=approval_id)
+    return approval
+
+
+async def reset_orphaned_executing(db: AsyncSession) -> int:
+    """Reset any approvals stuck in 'executing' back to 'failed'.
+
+    Meant to be called once at process startup. If a process crashes or
+    restarts after claim_executing() has claimed an approval (approved ->
+    executing) but before mark_executed() ever runs, the row is stuck in
+    'executing' forever — and since claim_executing() only matches rows
+    still in 'approved', a stuck 'executing' row can never be claimed
+    (or re-executed) again. This unblocks it.
+
+    'approved' rows are deliberately left untouched: that status means no
+    one has claimed execution yet, so it's still a normal, valid, claimable
+    state — nuking it here would be wrong, not just unnecessary.
+
+    Out of scope (see kopis #10): distributed locking across multiple
+    concurrently-running replicas. This assumes a single process resetting
+    its own leftovers on its own startup, not reaching across to reset a
+    peer's genuinely in-flight execution.
+    """
+    stmt = (
+        update(Approval)
+        .where(Approval.status == "executing")
+        .values(
+            status="failed",
+            execution_result={"error": "Execution lost — process restarted before completion"},
+        )
+        .returning(Approval.id)
+    )
+    result = await db.execute(stmt)
+    reset_ids = [row[0] for row in result.all()]
+    await db.commit()
+
+    for approval_id in reset_ids:
+        log.warning("orphaned_approval_reset", approval_id=approval_id)
+    if reset_ids:
+        log.info("orphaned_approvals_fixed", count=len(reset_ids))
+    return len(reset_ids)
+
+
 async def mark_executed(
     db: AsyncSession,
     approval_id: str,
     result: dict,
     success: bool = True,
 ) -> Approval | None:
-    approval = await get_approval(db, approval_id)
-    if not approval:
-        return None
+    """Transition executing -> executed|failed.
 
-    approval.status = "executed" if success else "failed"
-    approval.executed_at = datetime.now(timezone.utc)
-    approval.execution_result = result
-    await db.commit()
-    await db.refresh(approval)
+    Requires the approval to currently be "executing" (i.e. previously
+    claimed via claim_executing). If it isn't — e.g. this is called twice,
+    or the row was reset by orphan-recovery in between — the UPDATE matches
+    no row and this is a no-op, so we never clobber a state transition that
+    already happened.
+    """
+    approval = await _atomic_transition(
+        db,
+        approval_id,
+        from_status="executing",
+        values={
+            "status": "executed" if success else "failed",
+            "executed_at": datetime.now(timezone.utc),
+            "execution_result": result,
+        },
+    )
+    if approval is None:
+        log.warning("mark_executed_no_matching_row", approval_id=approval_id)
     return approval
 
 
